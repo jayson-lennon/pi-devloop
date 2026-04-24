@@ -1,0 +1,16 @@
+{
+  "name": "devloop",
+  "version": "0.1.0",
+  "description": "Phased workflow extension for Pi — plan, review, implement, integrate loop",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
