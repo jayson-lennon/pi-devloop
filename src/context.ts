@@ -40,6 +40,7 @@ function getHighLevelPlanningContext(state: WorkflowState): string {
 		`  - Identify gaps, risks, and ambiguities\n` +
 		`  - Ask the user clarifying questions using a "### Questions for the user" section\n` +
 		`- When the plan is ready for final approval, output: [HIGH-LEVEL PLAN COMPLETE]\n` +
+		`- After outputting the marker, tell the user the plan is ready and they should use /workflow start to begin implementation\n` +
 		`- Save the plan to ${state.workflowDir}high-level.md\n\n` +
 		`Do NOT implement anything — only plan.`
 	);

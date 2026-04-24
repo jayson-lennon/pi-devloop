@@ -69,15 +69,10 @@ async function handlePlan(
 	}
 
 	const state = createWorkflow(ctx.cwd, task);
-	ctx.ui.notify(`Created workflow: "${task}" (${state.workflowDir})`, "info");
-
-	pi.sendUserMessage(
-		`Create a high-level plan for: ${task}\n\n` +
-			`Explore the codebase first, then create a plan with numbered phases.\n` +
-			`Use ### Phase N: <name> headers for each phase.\n` +
-			`Save the plan to ${state.workflowDir}high-level.md\n` +
-			`After creating the plan, self-review it and ask me clarifying questions.\n` +
-			`When the plan is ready for approval, output: [HIGH-LEVEL PLAN COMPLETE]`,
+	ctx.ui.notify(
+		`Workflow created: "${task}"\n` +
+		`Now type your full task description and the agent will start planning.`,
+		"info",
 	);
 }
 
@@ -90,9 +85,40 @@ async function handleStart(pi: ExtensionAPI, ctx: ExtensionCommandContext): Prom
 		return;
 	}
 
+	if (state.status === "planning") {
+		// Plan was created but never formally approved.
+		// Try to parse the plan file and approve it now.
+		const plan = loadPlanFile(ctx.cwd, state.workflowDir, "high-level.md");
+		if (!plan || !plan.trim()) {
+			ctx.ui.notify("No plan file found. Describe what you want first, then try again.", "error");
+			return;
+		}
+
+		const phases = parsePhasesFromPlan(plan);
+		if (phases.length === 0) {
+			ctx.ui.notify(
+				"Plan file exists but no phases detected. Ensure it uses ### Phase N: <name> headers.",
+				"error",
+			);
+			return;
+		}
+
+		const choice = await ctx.ui.select(
+			`High-level plan found with ${phases.length} phases. Approve and start?`,
+			["✅ Approve and start implementation", "❌ Cancel"],
+		);
+
+		if (!choice || !choice.startsWith("✅")) return;
+
+		state.phases = phases;
+		state.status = "ready";
+		saveWorkflow(ctx.cwd, state);
+		ctx.ui.notify("Plan approved.", "success");
+	}
+
 	if (state.status !== "ready") {
 		ctx.ui.notify(
-			`Workflow is in "${state.status}" state. Expected "ready".\n` +
+			`Workflow is in "${state.status}" state. Expected "planning" or "ready".\n` +
 				`Use /workflow status for details.`,
 			"error",
 		);
