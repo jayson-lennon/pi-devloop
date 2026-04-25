@@ -11,4 +11,4 @@ argument-hint: "<plan-dir>"
 4. Review the saved plan for major issues that might result in failure to implement the feature. Also comment on potentially insecure or performance implications. Divergence from the plan is _not_ something to comment on.
 5. Report potential problems to the user.
 
-Do NOT implement anything — only plan. WAIT FOR USER APPROVAL.
+Do NOT implement anything — only plan. WAIT FOR USER APPROVAL with the message "Waiting for your approval. When everything looks good, select 'Implement'.".
