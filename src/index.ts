@@ -148,10 +148,8 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
     // ─── Widget management ──────────────────────────────────────────────
 
-    function refreshWidget(ctx: { cwd: string; hasUI: boolean; ui: any }): void {
-        if (!activeSlug || !ctx.hasUI) return;
-
-        const planContent = readHighLevelPlan(ctx.cwd, activeSlug);
+    function getWorkflowStatus(cwd: string): { phases: PhaseInfo[]; workflowStep: string } {
+        const planContent = activeSlug ? readHighLevelPlan(cwd, activeSlug) : null;
         const phases = planContent ? parsePhases(planContent) : [];
 
         let workflowStep: string;
@@ -163,6 +161,13 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             workflowStep = "implementing";
         }
 
+        return { phases, workflowStep };
+    }
+
+    function refreshWidget(ctx: { cwd: string; hasUI: boolean; ui: any }): void {
+        if (!activeSlug || !ctx.hasUI) return;
+
+        const { phases, workflowStep } = getWorkflowStatus(ctx.cwd);
         const lines = renderProgressLines(ctx.ui.theme, activeSlug, phases, workflowStep);
         ctx.ui.setWidget(WIDGET_ID, lines);
     }
@@ -466,6 +471,18 @@ You can use the session_query tool with this path to look up decisions, discussi
 
     pi.on("agent_end", async (_event, ctx) => {
         refreshWidget(ctx);
+
+        // Auto-exit when all phases are complete — stop spamming popups
+        if (activeSlug) {
+            const { phases, workflowStep } = getWorkflowStatus(ctx.cwd);
+            if (workflowStep === "complete") {
+                const slug = activeSlug;
+                clearState(ctx);
+                ctx.ui.notify(`DevLoop "${slug}" complete — all phases done.`, "success");
+                return;
+            }
+        }
+
         await showDevloopPopup(ctx);
     });
 
