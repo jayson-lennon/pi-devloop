@@ -424,7 +424,7 @@ You can use the session_query tool with this path to look up decisions, discussi
             options = [
                 "💬 Talk to the agent",
                 "📄 Make detailed plan",
-                "🔨 Implement",
+                "🔨 Implement (press enter 3 times)",
                 "🚪 Exit devloop",
             ];
         } else {
