@@ -11,4 +11,4 @@ argument-hint: "<plan-dir>"
 4. Review the saved plan.
 5. Report potential problems to the user.
 
-Do NOT implement anything — only plan.
+Do NOT implement anything — only plan. WAIT FOR USER APPROVAL.

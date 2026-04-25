@@ -5,7 +5,7 @@ argument-hint: "<task description>"
 
 Create a high-level implementation plan for the task detailed at the end of this prompt.
 
-DO NOT IMPLEMENT THE PLAN.
+DO NOT IMPLEMENT THE PLAN. WAIT FOR USER APPROVAL.
 
 ## Instructions
 
