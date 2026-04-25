@@ -240,11 +240,12 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             if (sub === "new") {
                 await handleNew(rest, ctx);
             } else if (sub === "resume") {
-                const slug = rest.trim();
-                if (!slug) {
-                    ctx.ui.notify("Usage: /devloop resume <slug>", "warning");
+                const raw = rest.trim();
+                if (!raw) {
+                    ctx.ui.notify("Usage: /devloop resume <task description or slug>", "warning");
                     return;
                 }
+                const slug = slugify(raw);
                 if (!planFileExists(ctx.cwd, slug)) {
                     ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
                     return;
