@@ -584,26 +584,31 @@ ${implementPrompt}
 Parent session: ${currentSessionFile}
 You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
 
+        // Capture autoMode before session switch — withSession runs after
+        // session_start, which resets and restores closure state.
+        const shouldAutoSubmit = autoMode;
+
         const result = await ctx.newSession({
             parentSession: currentSessionFile,
             setup: async (sm) => {
                 sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true, autoMode: true });
+            },
+            withSession: async (newCtx) => {
+                // withSession runs after session replacement: old pi/ctx are stale.
+                // Use only newCtx for session-bound work.
+                pi.setSessionName(slug);
+
+                if (shouldAutoSubmit) {
+                    await newCtx.sendUserMessage(fullPrompt);
+                } else {
+                    newCtx.ui.setEditorText(fullPrompt);
+                }
             },
         });
 
         if (result.cancelled) {
             ctx.ui.notify("Handoff cancelled.", "info");
             return;
-        }
-
-        pi.setSessionName(slug);
-
-        if (autoMode) {
-            // Auto mode: submit the implementation prompt immediately
-            pi.sendUserMessage(fullPrompt);
-        } else {
-            // Manual mode: put prompt in editor for user to review and press Enter
-            ctx.ui.setEditorText(fullPrompt);
         }
     }
 
