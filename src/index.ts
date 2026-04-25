@@ -53,8 +53,8 @@
  *      pi.events.emit("devloop:implement", { slug }).
  *
  *   3. The event handler (registered during setup) calls
- *      handleDoImplement(cachedCmdCtx) — using the cached command context
- *      which HAS newSession().
+ *      handleDoImplement(slug, autoMode, cachedCmdCtx) — using the cached
+ *      command context which HAS newSession().
  *
  *   4. handleDoImplement calls ctx.newSession() on that cached context.
  *
@@ -96,11 +96,6 @@
  * ExtensionCommandContext with sendUserMessage() and sendMessage().
  * But it does NOT have setSessionName — that's only on `pi`.
  *
- * This is why handleDoImplement does NOT call pi.setSessionName() inside
- * withSession. We traded the cosmetic session name for actually working
- * prompt delivery. If Pi adds setSessionName to ReplacedSessionContext
- * in the future, we can restore it.
- *
  * ── State persistence across sessions ───────────────────────────────────
  *
  * Extension closure state (activeSlug, autoMode, etc.) is per-instance.
@@ -131,158 +126,16 @@
  * custom entry. No separate /devloop resume command is needed.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-const ENTRY_TYPE = "devloop-state";
-const WIDGET_ID = "devloop-progress";
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Slugify a string: lowercase, non-alphanumeric → dash, collapse doubles */
-function slugify(text: string): string {
-    return text
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
-}
-
-/** Resolve path to a prompt file bundled with this extension */
-function promptPath(name: string): string {
-    const extDir = dirname(new URL(import.meta.url).pathname);
-    return join(extDir, "..", "prompts", name);
-}
-
-/** Read plan.md template, replace $1, and append the user's task after ## TASK */
-function assemblePlanPrompt(slug: string, task: string): string {
-    let template = readFileSync(promptPath("plan.md"), "utf-8");
-    template = template.replace(/\$1/g, slug);
-    template = template.replace(/^---[\s\S]*?---\n*/, "");
-    return template + "\n" + task;
-}
-
-/** Read plan-detailed.md template and replace $1 */
-function assemblePlanDetailedPrompt(slug: string): string {
-    const template = readFileSync(promptPath("plan-detailed.md"), "utf-8");
-    const body = template.replace(/^---[\s\S]*?---\n*/, "");
-    return body.replace(/\$1/g, slug);
-}
-
-/** Read implement.md template and replace $1 */
-function assembleImplementPrompt(slug: string): string {
-    const template = readFileSync(promptPath("implement.md"), "utf-8");
-    const body = template.replace(/^---[\s\S]*?---\n*/, "");
-    return body.replace(/\$1/g, slug);
-}
-
-/** Check if the high-level plan file exists on disk */
-function planFileExists(cwd: string, slug: string): boolean {
-    return existsSync(resolve(cwd, ".plans", slug, "high-level.md"));
-}
-
-/** Read the high-level plan file contents */
-function readHighLevelPlan(cwd: string, slug: string): string | null {
-    const path = resolve(cwd, ".plans", slug, "high-level.md");
-    try {
-        return readFileSync(path, "utf-8");
-    } catch {
-        return null;
-    }
-}
-
-// ─── Phase Parsing ───────────────────────────────────────────────────────────
-
-interface PhaseInfo {
-    index: number;
-    name: string;
-    done: boolean;
-}
-
-function parsePhases(planContent: string): PhaseInfo[] {
-    const phases: PhaseInfo[] = [];
-    const regex = /^- \[([ xX])\] (?:\*\*)?Phase (\d+):(?:\*\*)? (.+?)(?:\*\*)?$/gm;
-    let match;
-    while ((match = regex.exec(planContent)) !== null) {
-        phases.push({
-            index: parseInt(match[2]!, 10),
-            name: match[3]!.trim(),
-            done: match[1]!.toLowerCase() === "x",
-        });
-    }
-    return phases;
-}
-
-/** Render phase progress lines using theme colors */
-function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], workflowStep: string, mode: "auto" | "manual"): string[] {
-    const th = theme;
-    const lines: string[] = [];
-
-    lines.push(th.fg("accent", th.bold("DevLoop")) + th.fg("dim", `: ${slug}`));
-
-    if (phases.length > 0) {
-        const completed = phases.filter((p) => p.done).length;
-        const total = phases.length;
-        const barWidth = 12;
-        const filled = Math.round((completed / total) * barWidth);
-        const empty = barWidth - filled;
-        const bar = th.fg("success", "█".repeat(filled)) + th.fg("dim", "░".repeat(empty));
-        const count = th.fg("dim", `${completed}/${total}`);
-        lines.push(` ${bar} ${count}`);
-
-        for (const phase of phases) {
-            const icon = phase.done ? th.fg("success", "✓") : th.fg("dim", "○");
-            const name = phase.done ? th.fg("dim", phase.name) : th.fg("text", phase.name);
-            const num = th.fg("accent", `P${phase.index}`);
-            lines.push(` ${icon} ${num} ${name}`);
-        }
-    } else {
-        lines.push(th.fg("dim", " No phases yet"));
-    }
-
-    const stepIcon = workflowStep === "complete" ? th.fg("success", "✓") : th.fg("warning", "⚙");
-    lines.push(` ${stepIcon} ${workflowStep}`);
-
-    const modeLabel = mode === "auto"
-        ? th.fg("accent", "⚙ Auto")
-        : th.fg("dim", "🖐 Manual");
-    lines.push(` ${modeLabel}`);
-
-    return lines;
-}
-
-/** Check if context utilization exceeds 70% of the context window */
-function isContextOverLimit(ctx: { getContextUsage(): { tokens: number; contextWindow: number } | null }): boolean {
-    const usage = ctx.getContextUsage();
-    if (!usage || !usage.contextWindow) return false;
-    return usage.tokens / usage.contextWindow > 0.70;
-}
-
-/** Determine the next auto-loop action based on plan files on disk */
-type NextStep = "plan" | "implement" | "complete";
-
-function deriveNextStep(cwd: string, slug: string): NextStep {
-    const planContent = readHighLevelPlan(cwd, slug);
-    if (!planContent) return "plan"; // No plan yet — shouldn't happen in auto mode, but safe default
-
-    const phases = parsePhases(planContent);
-
-    // All done
-    if (phases.length === 0 || phases.every((p) => p.done)) return "complete";
-
-    // Find first incomplete phase
-    const nextPhase = phases.find((p) => !p.done);
-    if (!nextPhase) return "complete";
-
-    // Check if detailed plan exists for this phase
-    const detailedPath = resolve(cwd, ".plans", slug, `phase-${nextPhase.index}-detailed.md`);
-    if (existsSync(detailedPath)) return "implement";
-
-    return "plan";
-}
+import { ENTRY_TYPE, WIDGET_ID } from "./constants.js";
+import { assemblePlanDetailedPrompt, assemblePlanPrompt, slugify } from "./helpers.js";
+import { deriveNextStep, getWorkflowStatus, isContextOverLimit, renderProgressLines } from "./phases.js";
+import { handleDoImplement } from "./implement.js";
+import { showDevloopPopup } from "./popup.js";
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
@@ -316,26 +169,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
     // ─── Widget management ──────────────────────────────────────────────
 
-    function getWorkflowStatus(cwd: string): { phases: PhaseInfo[]; workflowStep: string } {
-        const planContent = activeSlug ? readHighLevelPlan(cwd, activeSlug) : null;
-        const phases = planContent ? parsePhases(planContent) : [];
-
-        let workflowStep: string;
-        if (phases.length === 0) {
-            workflowStep = "planning";
-        } else if (phases.every((p) => p.done)) {
-            workflowStep = "complete";
-        } else {
-            workflowStep = "implementing";
-        }
-
-        return { phases, workflowStep };
-    }
-
     function refreshWidget(ctx: { cwd: string; hasUI: boolean; ui: any }): void {
         if (!activeSlug || !ctx.hasUI) return;
 
-        const { phases, workflowStep } = getWorkflowStatus(ctx.cwd);
+        const { phases, workflowStep } = getWorkflowStatus(ctx.cwd, activeSlug);
         const lines = renderProgressLines(
             ctx.ui.theme, activeSlug, phases, workflowStep,
             autoMode ? "auto" : "manual",
@@ -360,7 +197,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     }
 
     /** Mark devloop as complete — slug stays bound, auto/manual mode off */
-    function markComplete(ctx: { hasUI: boolean; ui: any }): void {
+    function markComplete(ctx: { cwd: string; hasUI: boolean; ui: any }): void {
         autoMode = false;
         needsPlanPrefix = false;
         cachedCmdCtx = undefined;
@@ -381,7 +218,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     //
     // Instead, it emits an event via pi.events.emit("devloop:implement").
     // The event handler (registered above) picks it up and calls
-    // handleDoImplement(cachedCmdCtx) which HAS the right context type.
+    // handleDoImplement(slug, autoMode, cachedCmdCtx) which HAS the right context type.
     //
     // This indirection is the entire reason the event bus pattern exists.
     // See module-level doc for the full explanation.
@@ -473,7 +310,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     pi.events.on("devloop:implement", async (data) => {
         const { slug } = data as { slug: string };
         if (!cachedCmdCtx || !activeSlug || activeSlug !== slug) return;
-        await handleDoImplement(cachedCmdCtx);
+        await handleDoImplement(slug, autoMode, cachedCmdCtx);
     });
 
     // "Auto mode" — enables auto + drives the loop immediately.
@@ -637,156 +474,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         }, { triggerTurn: false });
     }
 
-    // ─── handleDoImplement: Session handoff ────────────────────────────
-    //
-    // This is the most dangerous function in the extension. It calls
-    // ctx.newSession() which replaces the current session. After that
-    // point, the old `pi` and old `ctx` are STALE and will THROW if used
-    // for any session-bound operation.
-    //
-    // THINGS THAT HAVE BEEN TRIED AND FAILED:
-    //
-    //   ❌ pi.sendUserMessage(fullPrompt) after ctx.newSession()
-    //      → stale pi, throws. Message never appears in new session.
-    //      The process may crash or silently fail depending on the error.
-    //
-    //   ❌ pi.setSessionName(slug) inside withSession callback
-    //      → stale pi, throws. This was the bug that caused pi to exit
-    //      completely during auto-implement. The exception was unhandled
-    //      inside the withSession async callback and killed the process.
-    //
-    //   ❌ ctx.ui.setEditorText(fullPrompt) after ctx.newSession()
-    //      → stale ctx, throws. Same category as stale pi.
-    //
-    //   ❌ pi.sendMessage({ ... }, { triggerTurn: true }) after newSession
-    //      → stale pi, throws.
-    //
-    //   ❌ Not using withSession at all, just hoping newSession works
-    //      → new session is created but empty. No prompt delivered.
-    //      sendUserMessage on stale objects silently fails or crashes.
-    //
-    // WHAT WORKS: The withSession pattern (see handoff.ts example in Pi).
-    //
-    //   await ctx.newSession({
-    //       setup: async (sm) => { sm.appendCustomEntry(...) },
-    //       withSession: async (newCtx) => {
-    //           await newCtx.sendUserMessage(fullPrompt);  // ✅
-    //           newCtx.ui.setEditorText(fullPrompt);        // ✅
-    //           // pi.setSessionName(slug);                  // ❌ STILL STALE
-    //       },
-    //   });
-    //
-    // The withSession callback receives a fresh ReplacedSessionContext
-    // (newCtx) that is bound to the new session. Only use newCtx.
-    //
-    // Trade-off: We can't set the session name because pi.setSessionName
-    // is on the stale pi object and ReplacedSessionContext doesn't have it.
-    // Prompt delivery > cosmetic session name.
-    //
-    async function handleDoImplement(
-        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
-    ): Promise<void> {
-        if (!activeSlug) {
-            ctx.ui.notify("No active devloop.", "error");
-            return;
-        }
-
-        const slug = activeSlug;
-
-        const highLevelPlan = readHighLevelPlan(ctx.cwd, slug);
-        if (!highLevelPlan) {
-            ctx.ui.notify(
-                `No high-level plan found at .plans/${slug}/high-level.md. Accept the plan first.`,
-                "error",
-            );
-            return;
-        }
-
-        const implementPrompt = assembleImplementPrompt(slug);
-
-        const currentSessionFile = ctx.sessionManager.getSessionFile();
-
-        const branch = ctx.sessionManager.getBranch();
-        let lastAssistantMsg = "";
-        for (let i = branch.length - 1; i >= 0; i--) {
-            const entry = branch[i];
-            if (entry.type === "message" && (entry as any).message?.role === "assistant") {
-                const content = (entry as any).message.content;
-                if (Array.isArray(content)) {
-                    lastAssistantMsg = content
-                        .filter((c: any) => c.type === "text")
-                        .map((c: any) => c.text)
-                        .join("\n");
-                } else if (typeof content === "string") {
-                    lastAssistantMsg = content;
-                }
-                break;
-            }
-        }
-
-        const fullPrompt = `Here is the high-level plan for the current workflow:
-
-${highLevelPlan}
-
----
-
-Last assistant message from the planning session:
-
-<last_assistant_msg>
-
-${lastAssistantMsg}
-
-</last_assistant_msg>
-
----
-
-${implementPrompt}
-
----
-
-Parent session: ${currentSessionFile}
-You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
-
-        // Capture autoMode BEFORE session switch.
-        //
-        // withSession runs AFTER session_start, which means:
-        //   1. New extension instance created
-        //   2. session_start handler fires → resets activeSlug/autoMode → reads
-        //      custom entry back → restores autoMode = true in NEW instance
-        //   3. withSession fires in ORIGINAL instance closure
-        //
-        // But closure `autoMode` in the ORIGINAL instance may have been
-        // reset by the old instance's session_start or shutdown. So we
-        // capture it here as a plain boolean (shouldAutoSubmit) which is
-        // just stack data — it survives fine across the closure boundary.
-        const shouldAutoSubmit = autoMode;
-
-        const result = await ctx.newSession({
-            parentSession: currentSessionFile,
-            setup: async (sm) => {
-                sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true, autoMode: true });
-            },
-            withSession: async (newCtx) => {
-                // withSession runs after session replacement: old pi/ctx are stale.
-                // Use only newCtx for session-bound work.
-                //
-                // NOTE: pi.setSessionName(slug) would throw here — pi is stale.
-                // Session name is less important than getting the prompt delivered.
-
-                if (shouldAutoSubmit) {
-                    await newCtx.sendUserMessage(fullPrompt);
-                } else {
-                    newCtx.ui.setEditorText(fullPrompt);
-                }
-            },
-        });
-
-        if (result.cancelled) {
-            ctx.ui.notify("Handoff cancelled.", "info");
-            return;
-        }
-    }
-
     // ─── Hook: input ──────────────────────────────────────────────────────
 
     pi.on("input", async (event, ctx) => {
@@ -801,105 +488,6 @@ You can use the session_query tool with this path to look up decisions, discussi
         return { action: "transform", text: combined };
     });
 
-    // ─── Popup logic ─────────────────────────────────────────────────────
-    //
-    // The popup shows context-aware options after every agent turn.
-    // Options depend on the current state: what files exist on disk,
-    // whether auto mode is on, and whether all phases are complete.
-    //
-    // There are four popup states:
-    //
-    //   COMPLETE (all phases done):
-    //     Title says "Implementation complete". Only option is "talk to agent."
-    //     The widget stays visible showing all phases checked off.
-    //
-    //   AUTO (auto mode on, phases remain):
-    //     Only option is "switch to manual." Auto drives itself.
-    //
-    //   PRE-PLAN (manual, no high-level plan on disk yet):
-    //     Accept the plan (with or without auto), or talk to agent.
-    //
-    //   POST-PLAN (manual, plan exists, phases remain):
-    //     Make detailed plan, implement, enable auto, or talk to agent.
-    //
-
-    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }): Promise<void> {
-        if (!activeSlug || !ctx.hasUI) return;
-
-        const slug = activeSlug;
-        const planExists = planFileExists(ctx.cwd, slug);
-        const { workflowStep } = getWorkflowStatus(ctx.cwd);
-
-        let options: string[];
-        let title: string;
-
-        if (workflowStep === "complete") {
-            // All phases done — show minimal popup
-            title = `DevLoop: ${slug} — Implementation complete\n\nAll phases are done. The session is still bound to this devloop.`;
-            options = [
-                "💬 Talk to the agent",
-            ];
-        } else if (autoMode) {
-            title = `DevLoop: ${slug} ⚙ Auto Mode\n\nAuto mode is driving the loop. Switch to manual to pick actions yourself.`;
-            options = [
-                "🖐 Switch to manual",
-            ];
-        } else if (!planExists) {
-            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat`;
-            options = [
-                "💬 Talk to the agent",
-                "✅ Accept plan",
-                "✅ Accept plan & Auto mode",
-            ];
-        } else {
-            title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat`;
-            options = [
-                "💬 Talk to the agent",
-                "📄 Make detailed plan",
-                "🔨 Implement (new session)",
-                "⚡ Auto mode",
-            ];
-        }
-
-        const choice = await ctx.ui.select(title, options);
-
-        if (!choice || choice.startsWith("💬 Talk to the agent")) {
-            return;
-        }
-
-        // ── Emit events for all actions ──
-
-        if (choice.startsWith("✅ Accept plan & Auto mode")) {
-            pi.events.emit("devloop:accept-and-auto");
-            return;
-        }
-
-        if (choice.startsWith("✅ Accept plan")) {
-            pi.events.emit("devloop:accept-plan");
-            return;
-        }
-
-        if (choice.startsWith("📄 Make detailed plan")) {
-            pi.events.emit("devloop:plan-detailed");
-            return;
-        }
-
-        if (choice.startsWith("🔨 Implement")) {
-            pi.events.emit("devloop:implement", { slug });
-            return;
-        }
-
-        if (choice.startsWith("⚡ Auto mode")) {
-            pi.events.emit("devloop:auto");
-            return;
-        }
-
-        if (choice.startsWith("🖐 Switch to manual")) {
-            pi.events.emit("devloop:manual");
-            return;
-        }
-    }
-
     // ─── Hook: agent_end ──────────────────────────────────────────────────
 
     pi.on("agent_end", async (event, ctx) => {
@@ -907,12 +495,12 @@ You can use the session_query tool with this path to look up decisions, discussi
 
         if (!activeSlug) return;
 
-        const { workflowStep } = getWorkflowStatus(ctx.cwd);
+        const { workflowStep } = getWorkflowStatus(ctx.cwd, activeSlug);
 
         // All phases complete — mark done and show completion popup
         if (workflowStep === "complete") {
             markComplete(ctx);
-            await showDevloopPopup(ctx);
+            await showDevloopPopup(pi, ctx, activeSlug, autoMode);
             return;
         }
 
@@ -933,12 +521,12 @@ You can use the session_query tool with this path to look up decisions, discussi
             }
             // Turn was aborted (user hit ESC) — show popup so they can
             // decide whether to keep driving or switch to manual.
-            await showDevloopPopup(ctx);
+            await showDevloopPopup(pi, ctx, activeSlug, autoMode);
             return;
         }
 
         // Manual mode: show popup
-        await showDevloopPopup(ctx);
+        await showDevloopPopup(pi, ctx, activeSlug, autoMode);
     });
 
     // ─── Shortcut: Ctrl+Q ────────────────────────────────────────────────────
@@ -947,7 +535,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         description: "Show devloop popup",
         handler: async (ctx) => {
             refreshWidget(ctx);
-            await showDevloopPopup(ctx);
+            await showDevloopPopup(pi, ctx, activeSlug, autoMode);
         },
     });
 }
