@@ -6,7 +6,7 @@
  *
  * Commands:
  *   /devloop new <task>    — Start a new devloop workflow
- *   /devloop resume <slug> — Re-attach devloop to an existing plan
+ *   /devloop resume [slug] — Re-attach devloop to an existing plan (auto-detects if omitted)
  *   /devloop exit          — Exit the current devloop
  *   /devloop _implement    — (internal) Hand off to new session
  *
@@ -16,9 +16,9 @@
  * A persistent widget shows phase progress above the editor when a devloop is active.
  */
 
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -82,6 +82,20 @@ function readHighLevelPlan(cwd: string, slug: string): string | null {
         return readFileSync(path, "utf-8");
     } catch {
         return null;
+    }
+}
+
+/** Discover all plan slugs that have a high-level.md on disk */
+function discoverPlanSlugs(cwd: string): string[] {
+    const plansDir = resolve(cwd, ".plans");
+    if (!existsSync(plansDir)) return [];
+    try {
+        return readdirSync(plansDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory() && existsSync(resolve(plansDir, d.name, "high-level.md")))
+            .map((d) => d.name)
+            .sort();
+    } catch {
+        return [];
     }
 }
 
@@ -181,6 +195,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     let activeSlug: string | undefined;
     let needsPlanPrefix = false;
     let autoMode = false;
+    let cachedCmdCtx: ExtensionCommandContext | undefined;
 
     // ─── Widget management ──────────────────────────────────────────────
 
@@ -231,6 +246,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         activeSlug = undefined;
         needsPlanPrefix = false;
         autoMode = false;
+        cachedCmdCtx = undefined;  // Invalidate cached context
         clearWidget(ctx);
         persistState();
     }
@@ -273,15 +289,94 @@ export default function devloopExtension(pi: ExtensionAPI): void {
                 return;
             }
             case "implement": {
-                // Spawn sub-session via command dispatch
-                //
-                // Alternative (if deliverAs: "followUp" doesn't work from agent_end):
-                //   Try without deliverAs (agent should be idle): pi.sendUserMessage("/devloop _implement")
-                //   Or use pi.sendMessage with triggerTurn: pi.sendMessage({ customType: "devloop-auto-implement", content: "/devloop _implement", display: true }, { triggerTurn: true })
-                pi.sendUserMessage("/devloop _implement", { deliverAs: "followUp" });
+                // Spawn sub-session via event bus → command handler bridge.
+                // agent_end only has ExtensionContext, can't call newSession().
+                // Emit event so the cached command context can handle it.
+                pi.events.emit("devloop:implement", { slug: activeSlug });
                 return;
             }
         }
+    }
+
+    // ─── Event bus handlers ─────────────────────────────────────────────────
+
+    pi.events.on("devloop:accept-plan", () => {
+        if (!activeSlug) return;
+        pi.sendUserMessage(
+            `The plan looks good. Save it to \`.plans/${activeSlug}/high-level.md\` now.`,
+            { deliverAs: "followUp" },
+        );
+    });
+
+    pi.events.on("devloop:accept-and-auto", () => {
+        if (!activeSlug) return;
+        autoMode = true;
+        persistState();
+        if (cachedCmdCtx) refreshWidget(cachedCmdCtx);
+        pi.sendUserMessage(
+            `The plan looks good. Save it to \`.plans/${activeSlug}/high-level.md\` now.`,
+            { deliverAs: "followUp" },
+        );
+    });
+
+    pi.events.on("devloop:plan-detailed", () => {
+        if (!activeSlug) return;
+        pi.sendUserMessage(assemblePlanDetailedPrompt(activeSlug), { deliverAs: "followUp" });
+    });
+
+    pi.events.on("devloop:implement", async (data) => {
+        const { slug } = data as { slug: string };
+        if (!cachedCmdCtx || !activeSlug || activeSlug !== slug) return;
+        await handleDoImplement(cachedCmdCtx);
+    });
+
+    pi.events.on("devloop:auto-implement", () => {
+        if (!activeSlug) return;
+        autoMode = true;
+        persistState();
+        if (cachedCmdCtx) refreshWidget(cachedCmdCtx);
+        driveAutoLoop(cachedCmdCtx ?? { cwd: "", hasUI: false, ui: null, getContextUsage: () => null });
+    });
+
+    pi.events.on("devloop:switch-auto", () => {
+        if (!activeSlug) return;
+        autoMode = true;
+        persistState();
+        if (cachedCmdCtx) {
+            refreshWidget(cachedCmdCtx);
+            cachedCmdCtx.ui.notify("Auto mode enabled. The loop will drive automatically.", "info");
+        }
+    });
+
+    pi.events.on("devloop:continue-auto", () => {
+        if (!activeSlug) return;
+        driveAutoLoop(cachedCmdCtx ?? { cwd: "", hasUI: false, ui: null, getContextUsage: () => null });
+    });
+
+    pi.events.on("devloop:switch-manual", () => {
+        autoMode = false;
+        persistState();
+        if (cachedCmdCtx) {
+            refreshWidget(cachedCmdCtx);
+            cachedCmdCtx.ui.notify("Switched to manual mode.", "info");
+        }
+    });
+
+    pi.events.on("devloop:exit", () => {
+        if (!cachedCmdCtx) return;
+        const slug = activeSlug;
+        clearState(cachedCmdCtx);
+        cachedCmdCtx.ui.notify(`DevLoop "${slug}" exited.`, "info");
+    });
+
+    // ─── Resume helper ──────────────────────────────────────────────────
+
+    function resumeWithSlug(slug: string, ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1]): void {
+        activeSlug = slug;
+        persistState();
+        refreshWidget(ctx);
+        pi.setSessionName(slug);
+        ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
     }
 
     // ─── Session restore ──────────────────────────────────────────────────
@@ -318,13 +413,14 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         getArgumentCompletions: (prefix: string) => {
             const subcommands = [
                 { value: "new ", label: "new <task> — Start a new devloop workflow" },
-                { value: "resume ", label: "resume <slug> — Re-attach devloop to an existing plan" },
+                { value: "resume ", label: "resume [slug] — Re-attach devloop to an existing plan (auto-detects if omitted)" },
                 { value: "exit", label: "exit — Exit the current devloop" },
             ];
             if (!prefix) return subcommands;
             return subcommands.filter((s) => s.value.startsWith(prefix));
         },
         handler: async (args, ctx) => {
+            cachedCmdCtx = ctx;  // Cache for event handlers
             const parts = args.trim().split(/\s+/);
             const sub = parts[0];
             const rest = parts.slice(1).join(" ");
@@ -333,26 +429,43 @@ export default function devloopExtension(pi: ExtensionAPI): void {
                 await handleNew(rest, ctx);
             } else if (sub === "resume") {
                 const raw = rest.trim();
-                if (!raw) {
-                    ctx.ui.notify("Usage: /devloop resume <task description or slug>", "warning");
-                    return;
+
+                if (raw) {
+                    // Explicit slug provided — existing behavior
+                    const slug = slugify(raw);
+                    if (!planFileExists(ctx.cwd, slug)) {
+                        ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
+                        return;
+                    }
+                    resumeWithSlug(slug, ctx);
+                } else {
+                    // No args — auto-detect from .plans/*/high-level.md
+                    const slugs = discoverPlanSlugs(ctx.cwd);
+
+                    if (slugs.length === 0) {
+                        ctx.ui.notify("No plans found in .plans/. Create one with /devloop new.", "error");
+                        return;
+                    }
+
+                    if (slugs.length === 1) {
+                        resumeWithSlug(slugs[0], ctx);
+                        return;
+                    }
+
+                    // Multiple matches — show picker
+                    const choice = await ctx.ui.select(
+                        "Multiple plans found. Select one to resume:",
+                        slugs,
+                    );
+                    if (!choice) return;  // User dismissed picker
+                    resumeWithSlug(choice, ctx);
                 }
-                const slug = slugify(raw);
-                if (!planFileExists(ctx.cwd, slug)) {
-                    ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
-                    return;
-                }
-                activeSlug = slug;
-                persistState();
-                refreshWidget(ctx);
-                pi.setSessionName(slug);
-                ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
             } else if (sub === "_implement") {
                 await handleDoImplement(ctx);
             } else if (sub === "exit") {
                 handleExit(ctx);
             } else {
-                ctx.ui.notify("Usage: /devloop <new|resume|exit> [args]", "warning");
+                ctx.ui.notify("Usage: /devloop <new|resume|exit> [args]. Try /devloop resume to auto-detect.", "warning");
             }
         },
     });
@@ -487,10 +600,6 @@ You can use the session_query tool with this path to look up decisions, discussi
 
         if (autoMode) {
             // Auto mode: submit the implementation prompt immediately
-            //
-            // Alternative (if sendUserMessage fails after newSession due to timing):
-            //   Move prompt into setup callback via sm.appendMessage(), then trigger
-            //   turn with pi.sendMessage({ customType: "devloop-auto", content: fullPrompt, display: true }, { triggerTurn: true })
             pi.sendUserMessage(fullPrompt);
         } else {
             // Manual mode: put prompt in editor for user to review and press Enter
@@ -514,7 +623,7 @@ You can use the session_query tool with this path to look up decisions, discussi
 
     // ─── Popup logic (shared between agent_end, command, shortcut) ────────
 
-    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any; getContextUsage(): { tokens: number; contextWindow: number } | null }, paused = false): Promise<void> {
+    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }, paused = false): Promise<void> {
         if (!activeSlug || !ctx.hasUI) return;
 
         const slug = activeSlug;
@@ -524,7 +633,6 @@ You can use the session_query tool with this path to look up decisions, discussi
         let title: string;
 
         if (autoMode) {
-            // Auto mode popup — shown after ESC pause or via Ctrl+Q
             title = `DevLoop: ${slug} ⚙ Auto Mode\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 ...(paused ? ["▶ Continue auto-loop"] : []),
@@ -532,7 +640,6 @@ You can use the session_query tool with this path to look up decisions, discussi
                 "🚪 Exit devloop",
             ];
         } else if (!planExists) {
-            // No plan yet, manual mode
             title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 "💬 Talk to the agent",
@@ -541,7 +648,6 @@ You can use the session_query tool with this path to look up decisions, discussi
                 "🚪 Exit devloop",
             ];
         } else {
-            // Plan exists, manual mode
             title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 "💬 Talk to the agent",
@@ -559,75 +665,50 @@ You can use the session_query tool with this path to look up decisions, discussi
             return;
         }
 
-        // ── Manual mode: no plan ──
+        // ── Emit events for all actions ──
 
         if (choice.startsWith("✅ Accept & Auto-Implement")) {
-            autoMode = true;
-            persistState();
-            refreshWidget(ctx);
-            pi.sendUserMessage(
-                `The plan looks good. Save it to \`.plans/${slug}/high-level.md\` now.`,
-                { deliverAs: "followUp" },
-            );
+            pi.events.emit("devloop:accept-and-auto");
             return;
         }
 
         if (choice.startsWith("✅ Accept plan")) {
-            pi.sendUserMessage(
-                `The plan looks good. Save it to \`.plans/${slug}/high-level.md\` now.`,
-                { deliverAs: "followUp" },
-            );
+            pi.events.emit("devloop:accept-plan");
             return;
         }
 
-        // ── Manual mode: plan exists ──
-
         if (choice.startsWith("📄 Make detailed plan")) {
-            pi.sendUserMessage(assemblePlanDetailedPrompt(slug), { deliverAs: "followUp" });
+            pi.events.emit("devloop:plan-detailed");
             return;
         }
 
         if (choice.startsWith("🔨 Implement")) {
-            ctx.ui.setEditorText("/devloop _implement");
+            pi.events.emit("devloop:implement", { slug });
             return;
         }
 
         if (choice.startsWith("⚡ Auto-Implement")) {
-            autoMode = true;
-            persistState();
-            refreshWidget(ctx);
-            driveAutoLoop(ctx);
+            pi.events.emit("devloop:auto-implement");
             return;
         }
 
         if (choice.startsWith("⚡ Switch to auto")) {
-            autoMode = true;
-            persistState();
-            refreshWidget(ctx);
-            ctx.ui.notify("Auto mode enabled. The loop will drive automatically.", "info");
+            pi.events.emit("devloop:switch-auto");
             return;
         }
 
-        // ── Auto mode ──
-
         if (choice.startsWith("▶ Continue auto-loop")) {
-            driveAutoLoop(ctx);
+            pi.events.emit("devloop:continue-auto");
             return;
         }
 
         if (choice.startsWith("🖐 Switch to manual")) {
-            autoMode = false;
-            persistState();
-            refreshWidget(ctx);
-            ctx.ui.notify("Switched to manual mode.", "info");
+            pi.events.emit("devloop:switch-manual");
             return;
         }
 
-        // ── Common ──
-
         if (choice.startsWith("🚪 Exit devloop")) {
-            clearState(ctx);
-            ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
+            pi.events.emit("devloop:exit");
             return;
         }
     }
@@ -661,10 +742,6 @@ You can use the session_query tool with this path to look up decisions, discussi
             }
 
             if (!wasAborted) {
-                //
-                // Alternative (if deliverAs: "followUp" doesn't work from agent_end):
-                //   Try without deliverAs (agent should be idle): pi.sendUserMessage("/devloop _implement")
-                //   Or use pi.sendMessage with triggerTurn: pi.sendMessage({ customType: "devloop-auto-implement", content: "/devloop _implement", display: true }, { triggerTurn: true })
                 driveAutoLoop(ctx);
                 return;
             }
