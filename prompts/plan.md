@@ -21,6 +21,7 @@ DO NOT IMPLEMENT THE PLAN.
 - All plans must use implementation phases (even 1 phase plans)
 - Use markdown checkboxes for implementation phases so that we can check them off as we go.
 - The plan must have an "Acceptance Criteria" section that shows the high-level goals.
+- The plan must have a "Problem" section at the beginning so the user and agent both understand what's being solved.
 
 ### Checkbox example
 
