@@ -1,6 +1,6 @@
 # DevLoop
 
-Phased task implementation workflow extension for [Pi](https://github.com/mariozechner/pi).
+Phased task implementation workflow extension for [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
 
 DevLoop is an attempt to address the fact that we can't perfectly plan a task. One small deviation can cascade into additional rogue changes that introduce unforeseen problems.
 
