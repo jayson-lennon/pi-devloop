@@ -5,9 +5,10 @@
  * session handoffs for implementation phases.
  *
  * Commands:
- *   /devloop-new <task>    — Start a new devloop workflow
- *   /devloop-resume <slug> — Re-attach devloop to an existing plan
- *   /devloop-exit          — Exit the current devloop
+ *   /devloop new <task>    — Start a new devloop workflow
+ *   /devloop resume <slug> — Re-attach devloop to an existing plan
+ *   /devloop exit          — Exit the current devloop
+ *   /devloop _implement    — (internal) Hand off to new session
  *
  * The extension shows a popup after every agent turn (when active) with
  * context-aware options based on whether the high-level plan exists on disk.
@@ -215,45 +216,46 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
     // ─── Commands ────────────────────────────────────────────────────────
 
-    pi.registerCommand("devloop-new", {
-        description: "Start a new devloop workflow",
+    pi.registerCommand("devloop", {
+        description: "DevLoop workflow commands",
         getArgumentCompletions: (prefix: string) => {
-            if (!prefix) return [{ value: " ", label: "<task description>" }];
-            return null;
+            const subcommands = [
+                { value: "new ", label: "new <task> — Start a new devloop workflow" },
+                { value: "resume ", label: "resume <slug> — Re-attach devloop to an existing plan" },
+                { value: "exit", label: "exit — Exit the current devloop" },
+            ];
+            if (!prefix) return subcommands;
+            return subcommands.filter((s) => s.value.startsWith(prefix));
         },
         handler: async (args, ctx) => {
-            await handleNew(args.trim(), ctx);
-        },
-    });
+            const parts = args.trim().split(/\s+/);
+            const sub = parts[0];
+            const rest = parts.slice(1).join(" ");
 
-    pi.registerCommand("devloop-resume", {
-        description: "Re-attach devloop to a slug (fixes broken state)",
-        getArgumentCompletions: (prefix: string) => {
-            if (!prefix) return [{ value: " ", label: "<slug> (directory name under .plans/)" }];
-            return null;
-        },
-        handler: async (args, ctx) => {
-            const slug = args.trim();
-            if (!slug) {
-                ctx.ui.notify("Usage: /devloop-resume <slug>", "warning");
-                return;
+            if (sub === "new") {
+                await handleNew(rest, ctx);
+            } else if (sub === "resume") {
+                const slug = rest.trim();
+                if (!slug) {
+                    ctx.ui.notify("Usage: /devloop resume <slug>", "warning");
+                    return;
+                }
+                if (!planFileExists(ctx.cwd, slug)) {
+                    ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
+                    return;
+                }
+                activeSlug = slug;
+                persistState();
+                refreshWidget(ctx);
+                pi.setSessionName(slug);
+                ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
+            } else if (sub === "_implement") {
+                await handleDoImplement(ctx);
+            } else if (sub === "exit") {
+                handleExit(ctx);
+            } else {
+                ctx.ui.notify("Usage: /devloop <new|resume|exit> [args]", "warning");
             }
-            if (!planFileExists(ctx.cwd, slug)) {
-                ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
-                return;
-            }
-            activeSlug = slug;
-            persistState();
-            refreshWidget(ctx);
-            pi.setSessionName(slug);
-            ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
-        },
-    });
-
-    pi.registerCommand("devloop-exit", {
-        description: "Exit the current devloop",
-        handler: async (_args, ctx) => {
-            handleExit(ctx);
         },
     });
 
@@ -415,7 +417,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         if (planExists) {
             title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
-                "💬 Free text",
+                "💬 Talk to the agent",
                 "📄 Make detailed plan",
                 "🔨 Implement",
                 "🚪 Exit devloop",
@@ -423,7 +425,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         } else {
             title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
-                "💬 Free text",
+                "💬 Talk to the agent",
                 "✅ Accept plan",
                 "🚪 Exit devloop",
             ];
@@ -431,7 +433,7 @@ You can use the session_query tool with this path to look up decisions, discussi
 
         const choice = await ctx.ui.select(title, options);
 
-        if (!choice || choice.startsWith("💬 Free text")) {
+        if (!choice || choice.startsWith("💬 Talk to the agent")) {
             return;
         }
 
@@ -449,7 +451,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         }
 
         if (choice.startsWith("🔨 Implement")) {
-            await handleDoImplement(ctx);
+            ctx.ui.setEditorText("/devloop _implement");
             return;
         }
 
