@@ -44,6 +44,12 @@ pi install https://github.com/jayson-lennon/pi-devloop
 
 Or clone this repo and reference it in your Pi extension config.
 
+### Get latest version
+
+```bash
+pi update https://github.com/jayson-lennon/pi-devloop
+```
+
 ## Commands
 
 | Command                  | Description                                                                                                                                     |
