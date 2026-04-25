@@ -108,7 +108,7 @@ function parsePhases(planContent: string): PhaseInfo[] {
 }
 
 /** Render phase progress lines using theme colors */
-function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], workflowStep: string): string[] {
+function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], workflowStep: string, mode: "auto" | "manual"): string[] {
     const th = theme;
     const lines: string[] = [];
 
@@ -137,7 +137,42 @@ function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], wo
     const stepIcon = workflowStep === "complete" ? th.fg("success", "✓") : th.fg("warning", "⚙");
     lines.push(` ${stepIcon} ${workflowStep}`);
 
+    const modeLabel = mode === "auto"
+        ? th.fg("accent", "⚙ Auto")
+        : th.fg("dim", "🖐 Manual");
+    lines.push(` ${modeLabel}`);
+
     return lines;
+}
+
+/** Check if context utilization exceeds 70% of the context window */
+function isContextOverLimit(ctx: { getContextUsage(): { tokens: number; contextWindow: number } | null }): boolean {
+    const usage = ctx.getContextUsage();
+    if (!usage || !usage.contextWindow) return false;
+    return usage.tokens / usage.contextWindow > 0.70;
+}
+
+/** Determine the next auto-loop action based on plan files on disk */
+type NextStep = "plan" | "implement" | "complete";
+
+function deriveNextStep(cwd: string, slug: string): NextStep {
+    const planContent = readHighLevelPlan(cwd, slug);
+    if (!planContent) return "plan"; // No plan yet — shouldn't happen in auto mode, but safe default
+
+    const phases = parsePhases(planContent);
+
+    // All done
+    if (phases.length === 0 || phases.every((p) => p.done)) return "complete";
+
+    // Find first incomplete phase
+    const nextPhase = phases.find((p) => !p.done);
+    if (!nextPhase) return "complete";
+
+    // Check if detailed plan exists for this phase
+    const detailedPath = resolve(cwd, ".plans", slug, `phase-${nextPhase.index}-detailed.md`);
+    if (existsSync(detailedPath)) return "implement";
+
+    return "plan";
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
@@ -145,6 +180,7 @@ function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], wo
 export default function devloopExtension(pi: ExtensionAPI): void {
     let activeSlug: string | undefined;
     let needsPlanPrefix = false;
+    let autoMode = false;
 
     // ─── Widget management ──────────────────────────────────────────────
 
@@ -168,7 +204,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         if (!activeSlug || !ctx.hasUI) return;
 
         const { phases, workflowStep } = getWorkflowStatus(ctx.cwd);
-        const lines = renderProgressLines(ctx.ui.theme, activeSlug, phases, workflowStep);
+        const lines = renderProgressLines(
+            ctx.ui.theme, activeSlug, phases, workflowStep,
+            autoMode ? "auto" : "manual",
+        );
         ctx.ui.setWidget(WIDGET_ID, lines);
     }
 
@@ -184,20 +223,72 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         pi.appendEntry(ENTRY_TYPE, {
             slug: activeSlug,
             active: !!activeSlug,
+            autoMode,
         });
     }
 
     function clearState(ctx: { hasUI: boolean; ui: any }): void {
         activeSlug = undefined;
         needsPlanPrefix = false;
+        autoMode = false;
         clearWidget(ctx);
         persistState();
+    }
+
+    // ─── Auto-loop drive logic ─────────────────────────────────────────────
+
+    /** Drive the auto-loop: determine next step and dispatch action */
+    function driveAutoLoop(ctx: { cwd: string; hasUI: boolean; ui: any; getContextUsage(): { tokens: number; contextWindow: number } | null }): void {
+        if (!activeSlug) return;
+
+        // Safety: abort if context is over 70%
+        if (isContextOverLimit(ctx)) {
+            const slug = activeSlug;
+            autoMode = false;
+            persistState();
+            clearWidget(ctx);
+            if (ctx.hasUI) {
+                ctx.ui.notify(
+                    `Auto-loop aborted: context utilization exceeded 70% in "${slug}". Switch to manual or compact the session.`,
+                    "warning",
+                );
+            }
+            return;
+        }
+
+        const nextStep = deriveNextStep(ctx.cwd, activeSlug);
+
+        switch (nextStep) {
+            case "complete": {
+                const slug = activeSlug;
+                clearState(ctx);
+                if (ctx.hasUI) {
+                    ctx.ui.notify(`Auto-loop complete — all phases done for "${slug}".`, "success");
+                }
+                return;
+            }
+            case "plan": {
+                // Plan-detailed in current session: send prompt as user message
+                pi.sendUserMessage(assemblePlanDetailedPrompt(activeSlug));
+                return;
+            }
+            case "implement": {
+                // Spawn sub-session via command dispatch
+                //
+                // Alternative (if deliverAs: "followUp" doesn't work from agent_end):
+                //   Try without deliverAs (agent should be idle): pi.sendUserMessage("/devloop _implement")
+                //   Or use pi.sendMessage with triggerTurn: pi.sendMessage({ customType: "devloop-auto-implement", content: "/devloop _implement", display: true }, { triggerTurn: true })
+                pi.sendUserMessage("/devloop _implement", { deliverAs: "followUp" });
+                return;
+            }
+        }
     }
 
     // ─── Session restore ──────────────────────────────────────────────────
 
     pi.on("session_start", async (_event, ctx) => {
         activeSlug = undefined;
+        autoMode = false;
 
         const entries = ctx.sessionManager.getEntries();
         for (let i = entries.length - 1; i >= 0; i--) {
@@ -209,6 +300,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
                 const data = (entry as any).data;
                 if (data?.active && data?.slug) {
                     activeSlug = data.slug;
+                    autoMode = !!data.autoMode;
                 }
                 break;
             }
@@ -382,7 +474,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         const result = await ctx.newSession({
             parentSession: currentSessionFile,
             setup: async (sm) => {
-                sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true });
+                sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true, autoMode: true });
             },
         });
 
@@ -392,7 +484,18 @@ You can use the session_query tool with this path to look up decisions, discussi
         }
 
         pi.setSessionName(slug);
-        ctx.ui.setEditorText(fullPrompt);
+
+        if (autoMode) {
+            // Auto mode: submit the implementation prompt immediately
+            //
+            // Alternative (if sendUserMessage fails after newSession due to timing):
+            //   Move prompt into setup callback via sm.appendMessage(), then trigger
+            //   turn with pi.sendMessage({ customType: "devloop-auto", content: fullPrompt, display: true }, { triggerTurn: true })
+            pi.sendUserMessage(fullPrompt);
+        } else {
+            // Manual mode: put prompt in editor for user to review and press Enter
+            ctx.ui.setEditorText(fullPrompt);
+        }
     }
 
     // ─── Hook: input ──────────────────────────────────────────────────────
@@ -411,7 +514,7 @@ You can use the session_query tool with this path to look up decisions, discussi
 
     // ─── Popup logic (shared between agent_end, command, shortcut) ────────
 
-    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }): Promise<void> {
+    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any; getContextUsage(): { tokens: number; contextWindow: number } | null }, paused = false): Promise<void> {
         if (!activeSlug || !ctx.hasUI) return;
 
         const slug = activeSlug;
@@ -420,19 +523,32 @@ You can use the session_query tool with this path to look up decisions, discussi
         let options: string[];
         let title: string;
 
-        if (planExists) {
+        if (autoMode) {
+            // Auto mode popup — shown after ESC pause or via Ctrl+Q
+            title = `DevLoop: ${slug} ⚙ Auto Mode\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            options = [
+                ...(paused ? ["▶ Continue auto-loop"] : []),
+                "🖐 Switch to manual",
+                "🚪 Exit devloop",
+            ];
+        } else if (!planExists) {
+            // No plan yet, manual mode
+            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            options = [
+                "💬 Talk to the agent",
+                "✅ Accept plan",
+                "✅ Accept & Auto-Implement",
+                "🚪 Exit devloop",
+            ];
+        } else {
+            // Plan exists, manual mode
             title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 "💬 Talk to the agent",
                 "📄 Make detailed plan",
                 "🔨 Implement (press enter 3 times)",
-                "🚪 Exit devloop",
-            ];
-        } else {
-            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
-            options = [
-                "💬 Talk to the agent",
-                "✅ Accept plan",
+                "⚡ Auto-Implement",
+                "⚡ Switch to auto",
                 "🚪 Exit devloop",
             ];
         }
@@ -440,6 +556,19 @@ You can use the session_query tool with this path to look up decisions, discussi
         const choice = await ctx.ui.select(title, options);
 
         if (!choice || choice.startsWith("💬 Talk to the agent")) {
+            return;
+        }
+
+        // ── Manual mode: no plan ──
+
+        if (choice.startsWith("✅ Accept & Auto-Implement")) {
+            autoMode = true;
+            persistState();
+            refreshWidget(ctx);
+            pi.sendUserMessage(
+                `The plan looks good. Save it to \`.plans/${slug}/high-level.md\` now.`,
+                { deliverAs: "followUp" },
+            );
             return;
         }
 
@@ -451,6 +580,8 @@ You can use the session_query tool with this path to look up decisions, discussi
             return;
         }
 
+        // ── Manual mode: plan exists ──
+
         if (choice.startsWith("📄 Make detailed plan")) {
             pi.sendUserMessage(assemblePlanDetailedPrompt(slug), { deliverAs: "followUp" });
             return;
@@ -461,6 +592,39 @@ You can use the session_query tool with this path to look up decisions, discussi
             return;
         }
 
+        if (choice.startsWith("⚡ Auto-Implement")) {
+            autoMode = true;
+            persistState();
+            refreshWidget(ctx);
+            driveAutoLoop(ctx);
+            return;
+        }
+
+        if (choice.startsWith("⚡ Switch to auto")) {
+            autoMode = true;
+            persistState();
+            refreshWidget(ctx);
+            ctx.ui.notify("Auto mode enabled. The loop will drive automatically.", "info");
+            return;
+        }
+
+        // ── Auto mode ──
+
+        if (choice.startsWith("▶ Continue auto-loop")) {
+            driveAutoLoop(ctx);
+            return;
+        }
+
+        if (choice.startsWith("🖐 Switch to manual")) {
+            autoMode = false;
+            persistState();
+            refreshWidget(ctx);
+            ctx.ui.notify("Switched to manual mode.", "info");
+            return;
+        }
+
+        // ── Common ──
+
         if (choice.startsWith("🚪 Exit devloop")) {
             clearState(ctx);
             ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
@@ -470,20 +634,46 @@ You can use the session_query tool with this path to look up decisions, discussi
 
     // ─── Hook: agent_end ──────────────────────────────────────────────────
 
-    pi.on("agent_end", async (_event, ctx) => {
+    pi.on("agent_end", async (event, ctx) => {
         refreshWidget(ctx);
 
-        // Auto-exit when all phases are complete — stop spamming popups
-        if (activeSlug) {
-            const { phases, workflowStep } = getWorkflowStatus(ctx.cwd);
-            if (workflowStep === "complete") {
-                const slug = activeSlug;
-                clearState(ctx);
-                ctx.ui.notify(`DevLoop "${slug}" complete — all phases done.`, "success");
-                return;
-            }
+        if (!activeSlug) return;
+
+        const { workflowStep } = getWorkflowStatus(ctx.cwd);
+
+        // Auto-exit when all phases are complete
+        if (workflowStep === "complete") {
+            const slug = activeSlug;
+            clearState(ctx);
+            ctx.ui.notify(`DevLoop "${slug}" complete — all phases done.`, "success");
+            return;
         }
 
+        // Auto mode: drive the loop (unless turn was aborted)
+        if (autoMode) {
+            const messages = event.messages ?? [];
+            let wasAborted = false;
+            for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i]?.role === "assistant") {
+                    wasAborted = messages[i].stopReason === "aborted";
+                    break;
+                }
+            }
+
+            if (!wasAborted) {
+                //
+                // Alternative (if deliverAs: "followUp" doesn't work from agent_end):
+                //   Try without deliverAs (agent should be idle): pi.sendUserMessage("/devloop _implement")
+                //   Or use pi.sendMessage with triggerTurn: pi.sendMessage({ customType: "devloop-auto-implement", content: "/devloop _implement", display: true }, { triggerTurn: true })
+                driveAutoLoop(ctx);
+                return;
+            }
+            // Turn was aborted (user hit ESC) — paused. Show popup with "Continue" option.
+            await showDevloopPopup(ctx, true);
+            return;
+        }
+
+        // Manual mode: show popup
         await showDevloopPopup(ctx);
     });
 
