@@ -95,7 +95,7 @@ interface PhaseInfo {
 
 function parsePhases(planContent: string): PhaseInfo[] {
     const phases: PhaseInfo[] = [];
-    const regex = /^- \[([ xX])\] Phase (\d+): (.+)$/gm;
+    const regex = /^- \[([ xX])\] (?:\*\*)?Phase (\d+):(?:\*\*)? (.+?)(?:\*\*)?$/gm;
     let match;
     while ((match = regex.exec(planContent)) !== null) {
         phases.push({
