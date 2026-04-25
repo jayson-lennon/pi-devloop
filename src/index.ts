@@ -1,534 +1,425 @@
 /**
- * DevLoop — Phased Workflow Extension for Pi
+ * DevLoop — Phased workflow extension for Pi
  *
- * Structures multi-phase development into a plan → review → implement → integrate loop.
- * State lives on disk in .plans/<slug>/. No coordinator session needed.
+ * Drives a plan → plan-detailed → implement loop with automatic
+ * session handoffs for implementation phases.
  *
  * Commands:
- *   /workflow plan <task>       — Create high-level plan
- *   /workflow start             — Begin implementation loop
- *   /workflow status            — Show current workflow state
- *   /workflow abort             — Abort the workflow
- *   /workflow continue          — Resume after interruption
- *   /workflow restart-phase     — Restart current phase from scratch
+ *   /devloop-new <task>   — Start a new devloop workflow
+ *   /devloop-next          — Show the devloop popup
+ *   /devloop-implement     — Hand off to new session and implement
+ *   /devloop-exit          — Exit the current devloop
+ *
+ * The extension shows a popup after every agent turn (when active) with
+ * context-aware options based on whether the high-level plan exists on disk.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { WorkflowState, DetectedMarker } from "./types.js";
-import {
-	findActiveWorkflow,
-	saveWorkflow,
-	savePlanFile,
-	loadPlanFile,
-	parsePhasesFromPlan,
-	phaseFilename,
-	loadAndDeleteHandoffPrompt,
-} from "./state.js";
-import { detectMarkers, getPrimaryMarker, extractTextFromMessage } from "./markers.js";
-import { getStepContext } from "./context.js";
-import {
-	gatePlanReview,
-	gateDetailedPlanReview,
-	gateImplementationReview,
-	gateBlocked,
-	gateNextPhase,
-} from "./gates.js";
-import { commitPhase } from "./git.js";
-import { checkAndNotify } from "./notifications.js";
-import { registerCommands } from "./commands.js";
-
-export default function devloop(pi: ExtensionAPI): void {
-	// Track the most recently detected marker for agent_end processing
-	let pendingMarker: DetectedMarker | null = null;
-
-	// ── Register Commands ───────────────────────────────────────────
-
-	registerCommands(pi);
-
-	// ── session_start ───────────────────────────────────────────────
-
-	pi.on("session_start", async (event, ctx) => {
-		const state = findActiveWorkflow(ctx.cwd);
-		if (!state) return;
-
-		// Check for pending handoff prompt (auto-submit)
-		const prompt = loadAndDeleteHandoffPrompt(ctx.cwd, state.workflowDir);
-		if (prompt && (event.reason === "new" || event.reason === "fork")) {
-			pi.sendUserMessage(prompt);
-			return;
-		}
-
-		// Show non-blocking notification
-		checkAndNotify(ctx, state);
-	});
-
-	// ── before_agent_start ──────────────────────────────────────────
-
-	pi.on("before_agent_start", async (_event, ctx) => {
-		const state = findActiveWorkflow(ctx.cwd);
-		if (!state) return;
-
-		// Only inject context when the workflow is actively running
-		if (state.status === "planning" || state.status === "active") {
-			const context = getStepContext(state, ctx.cwd);
-			if (context) {
-				return {
-					message: {
-						customType: "devloop-context",
-						content: context,
-						display: false,
-					},
-				};
-			}
-		}
-	});
-
-	// ── turn_end ────────────────────────────────────────────────────
-
-	pi.on("turn_end", async (event, _ctx) => {
-		const state = findActiveWorkflow(_ctx.cwd);
-		if (!state) return;
-
-		// Only watch for markers when workflow is active
-		if (state.status !== "planning" && state.status !== "active") return;
-
-		// Extract text from assistant message
-		if (event.message?.role !== "assistant") return;
-		const text = extractTextFromMessage(event.message);
-		if (!text) return;
-
-		// Detect markers
-		const markers = detectMarkers(text);
-		const primary = getPrimaryMarker(markers);
-
-		if (primary) {
-			pendingMarker = primary;
-		}
-	});
-
-	// ── agent_end ───────────────────────────────────────────────────
-
-	pi.on("agent_end", async (_event, ctx) => {
-		const state = findActiveWorkflow(ctx.cwd);
-		if (!state) return;
-
-		if (!pendingMarker) return;
-		const marker = pendingMarker;
-		pendingMarker = null;
-
-		// Route based on marker type and current workflow step
-		switch (marker.type) {
-			case "high_level_plan":
-				await handleHighLevelPlanComplete(pi, ctx, state);
-				break;
-
-			case "detailed_plan":
-				await handleDetailedPlanComplete(pi, ctx, state);
-				break;
-
-			case "implementation_review":
-				await handleImplementationReviewComplete(pi, ctx, state);
-				break;
-
-			case "blocked":
-				await handleBlocked(pi, ctx, state, marker.data ?? "Unknown reason");
-				break;
-
-			case "workflow_complete":
-				await handleWorkflowComplete(pi, ctx, state);
-				break;
-		}
-	});
-
-	// ── Handler: High-Level Plan Complete ───────────────────────────
-
-	async function handleHighLevelPlanComplete(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-	): Promise<void> {
-		const result = await gatePlanReview(ctx);
-
-		switch (result.action) {
-			case "approve": {
-				// Load and parse the plan
-				const plan = loadPlanFile(ctx.cwd, state.workflowDir, "high-level.md");
-				if (!plan) {
-					ctx.ui.notify("Could not read high-level plan file.", "error");
-					return;
-				}
-
-				const phases = parsePhasesFromPlan(plan);
-				if (phases.length === 0) {
-					ctx.ui.notify(
-						"No phases detected in plan. Ensure you used ### Phase N: <name> headers.",
-						"error",
-					);
-					// Let user revise
-					state.step = "high_level_planning";
-					saveWorkflow(ctx.cwd, state);
-					pi.sendUserMessage(
-						"No phases were detected in the plan. Please use ### Phase N: <name> headers and try again.",
-					);
-					return;
-				}
-
-				state.phases = phases;
-				state.status = "ready";
-				state.step = "done"; // Waiting for /workflow start
-				saveWorkflow(ctx.cwd, state);
-
-				ctx.ui.notify(
-					`Plan approved with ${phases.length} phases. Use /workflow start to begin.`,
-					"success",
-				);
-				break;
-			}
-
-			case "revise": {
-				if (result.feedback) {
-					pi.sendUserMessage(
-						`Revise the high-level plan based on this feedback:\n\n${result.feedback}\n\n` +
-							`When ready for approval, output: [HIGH-LEVEL PLAN COMPLETE]`,
-					);
-				}
-				break;
-			}
-
-			case "abort": {
-				state.status = "aborted";
-				saveWorkflow(ctx.cwd, state);
-				ctx.ui.notify("Workflow aborted.", "info");
-				break;
-			}
-		}
-	}
-
-	// ── Handler: Detailed Plan Complete ─────────────────────────────
-
-	async function handleDetailedPlanComplete(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-	): Promise<void> {
-		const phase = state.phases[state.currentPhaseIndex];
-		if (!phase) return;
-
-		// Different gate depending on whether we're starting fresh or coming from integration
-		if (state.step === "integrating") {
-			// This is a detailed plan for the NEXT phase after integration
-			await handleNextPhasePlanComplete(pi, ctx, state);
-		} else {
-			// First detailed plan or restart
-			const result = await gateDetailedPlanReview(
-				ctx,
-				phase,
-				state.currentPhaseIndex,
-				state.phases.length,
-			);
-
-			switch (result.action) {
-				case "approve": {
-					// Handoff to new session for implementation
-					pi.sendUserMessage("/workflow _handoff");
-					break;
-				}
-
-				case "revise": {
-					if (result.feedback) {
-						pi.sendUserMessage(
-							`Revise the detailed plan for Phase ${state.currentPhaseIndex + 1}: ${phase.name}\n\n` +
-								`Feedback:\n${result.feedback}\n\n` +
-								`When ready for approval, output: [DETAILED PLAN COMPLETE]`,
-						);
-					}
-					break;
-				}
-
-				case "restart": {
-					pi.sendUserMessage("/workflow restart-phase");
-					break;
-				}
-
-				case "abort": {
-					state.status = "aborted";
-					saveWorkflow(ctx.cwd, state);
-					ctx.ui.notify("Workflow aborted.", "info");
-					break;
-				}
-			}
-		}
-	}
-
-	// ── Handler: Next Phase Plan Complete (post-integration) ────────
-
-	async function handleNextPhasePlanComplete(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-	): Promise<void> {
-		// NOTE: state.currentPhaseIndex points to the phase that was just implemented.
-		// The detailed plan that was just created is for the NEXT phase (currentPhaseIndex + 1).
-		const nextPhaseIdx = state.currentPhaseIndex + 1;
-		const nextPhase = state.phases[nextPhaseIdx];
-		if (!nextPhase) return;
-
-		const result = await gateNextPhase(ctx, state, nextPhase);
-
-		switch (result.action) {
-			case "approve": {
-				// Git commit for the phase that was just implemented
-				const commitMsg = await commitPhase(pi, ctx.cwd, state);
-				ctx.ui.notify(commitMsg, "info");
-
-				// Advance to the next phase (the one we just planned)
-				state.phases[state.currentPhaseIndex].status = "complete";
-				state.currentPhaseIndex = nextPhaseIdx;
-				state.step = "implementing";
-				nextPhase.status = "in_progress";
-				saveWorkflow(ctx.cwd, state);
-
-				// Handoff to new session for implementation
-				pi.sendUserMessage("/workflow _handoff");
-				break;
-			}
-
-			case "revise": {
-				if (result.feedback) {
-					pi.sendUserMessage(
-						`Revise the detailed plan for Phase ${nextPhaseIdx + 1}: ${nextPhase.name}\n\n` +
-							`Feedback:\n${result.feedback}\n\n` +
-							`When ready for approval, output: [DETAILED PLAN COMPLETE]`,
-					);
-				}
-				break;
-			}
-
-			case "restart": {
-				// Restart the NEXT phase's planning (not the current one)
-				state.phases[state.currentPhaseIndex].status = "complete";
-				state.currentPhaseIndex = nextPhaseIdx;
-				state.step = "detailed_planning";
-				nextPhase.status = "in_progress";
-				saveWorkflow(ctx.cwd, state);
-				pi.sendUserMessage("/workflow restart-phase");
-				break;
-			}
-
-			case "edit_plan": {
-				// Escape hatch: let user edit the high-level plan
-				const currentPlan = loadPlanFile(ctx.cwd, state.workflowDir, "high-level.md") ?? "";
-				const edited = await ctx.ui.editor("Edit high-level plan:", currentPlan);
-				if (edited) {
-					savePlanFile(ctx.cwd, state.workflowDir, "high-level.md", edited);
-
-					// Re-parse phases (keep completed ones, update remaining)
-					const newPhases = parsePhasesFromPlan(edited);
-					if (newPhases.length > 0) {
-						// Keep completed phases up to and including current
-						const completedPhases = state.phases.slice(0, nextPhaseIdx);
-						// Take remaining phases from re-parsed plan
-						const remainingPhases = newPhases.slice(nextPhaseIdx);
-						state.phases = [...completedPhases, ...remainingPhases];
-						// Re-index
-						state.phases.forEach((p, i) => (p.index = i));
-						saveWorkflow(ctx.cwd, state);
-						ctx.ui.notify("High-level plan updated.", "success");
-					}
-
-					// Re-show the gate for the (possibly updated) next phase
-					await handleNextPhasePlanComplete(pi, ctx, state);
-				}
-				break;
-			}
-
-			case "abort": {
-				state.status = "aborted";
-				saveWorkflow(ctx.cwd, state);
-				ctx.ui.notify("Workflow aborted.", "info");
-				break;
-			}
-		}
-	}
-
-	// ── Handler: Implementation Review Complete ─────────────────────
-
-	async function handleImplementationReviewComplete(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-	): Promise<void> {
-		const phase = state.phases[state.currentPhaseIndex];
-		if (!phase) return;
-
-		const result = await gateImplementationReview(
-			ctx,
-			phase,
-			state.currentPhaseIndex,
-			state.phases.length,
-		);
-
-		switch (result.action) {
-			case "approve": {
-				// Advance to integration step
-				state.step = "integrating";
-				saveWorkflow(ctx.cwd, state);
-
-				pi.sendMessage(
-					{
-						customType: "devloop-instruction",
-						content:
-							`Implementation approved. Now integrate:\n\n` +
-							`1. Update the high-level plan (${state.workflowDir}high-level.md) with divergence notes for Phase ${state.currentPhaseIndex + 1}\n` +
-							`2. ${
-								state.currentPhaseIndex < state.phases.length - 1
-									? `Create a detailed plan for Phase ${state.currentPhaseIndex + 2}: ${state.phases[state.currentPhaseIndex + 1].name}\n` +
-									  `   Save to ${state.workflowDir}${phaseFilename(state.currentPhaseIndex + 1)}\n` +
-									  `   When ready, output: [DETAILED PLAN COMPLETE]`
-									: `This is the last phase. Output: [WORKFLOW COMPLETE]`
-							}`,
-						display: true,
-					},
-					{ triggerTurn: true },
-				);
-				break;
-			}
-
-			case "revise": {
-				// Minor issues — note them and continue to integration
-				const feedbackMsg = result.feedback
-					? `\n\nIssues noted:\n${result.feedback}`
-					: "";
-
-				state.step = "integrating";
-				saveWorkflow(ctx.cwd, state);
-
-				pi.sendMessage(
-					{
-						customType: "devloop-instruction",
-						content:
-							`Implementation approved with minor issues.${feedbackMsg}\n\n` +
-							`Now integrate:\n` +
-							`1. Update the high-level plan with divergence notes\n` +
-							`2. ${
-								state.currentPhaseIndex < state.phases.length - 1
-									? `Create detailed plan for next phase. Output: [DETAILED PLAN COMPLETE]`
-									: `Output: [WORKFLOW COMPLETE]`
-							}`,
-						display: true,
-					},
-					{ triggerTurn: true },
-				);
-				break;
-			}
-
-			case "restart": {
-				pi.sendUserMessage("/workflow restart-phase");
-				break;
-			}
-
-			case "abort": {
-				state.status = "aborted";
-				saveWorkflow(ctx.cwd, state);
-				ctx.ui.notify("Workflow aborted.", "info");
-				break;
-			}
-		}
-	}
-
-	// ── Handler: Blocked ────────────────────────────────────────────
-
-	async function handleBlocked(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-		reason: string,
-	): Promise<void> {
-		const phase = state.phases[state.currentPhaseIndex];
-		if (!phase) return;
-
-		const result = await gateBlocked(ctx, reason, phase);
-
-		switch (result.action) {
-			case "revise": {
-				// Provide guidance and retry
-				if (result.feedback) {
-					pi.sendUserMessage(
-						`Address this blocking issue:\n\n${result.feedback}\n\n` +
-							`After addressing it, continue implementation and perform a self-review.\n` +
-							`Output: [IMPLEMENTATION REVIEW COMPLETE]`,
-					);
-				}
-				break;
-			}
-
-			case "restart": {
-				pi.sendUserMessage("/workflow restart-phase");
-				break;
-			}
-
-			case "skip": {
-				// Mark phase as complete (skipped) and move on
-				state.phases[state.currentPhaseIndex].status = "complete";
-				state.currentPhaseIndex++;
-
-				if (state.currentPhaseIndex >= state.phases.length) {
-					state.step = "done";
-					state.status = "complete";
-					saveWorkflow(ctx.cwd, state);
-					ctx.ui.notify("Workflow complete (last phase skipped).", "info");
-				} else {
-					state.step = "integrating";
-					saveWorkflow(ctx.cwd, state);
-					pi.sendMessage(
-						{
-							customType: "devloop-instruction",
-							content:
-								`Phase was skipped due to blocking issue. Moving to next phase.\n` +
-								`Update the high-level plan noting the skip, then create a detailed plan for Phase ${state.currentPhaseIndex + 1}.\n` +
-								`Output: [DETAILED PLAN COMPLETE]`,
-							display: true,
-						},
-						{ triggerTurn: true },
-					);
-				}
-				break;
-			}
-
-			case "abort": {
-				state.status = "aborted";
-				saveWorkflow(ctx.cwd, state);
-				ctx.ui.notify("Workflow aborted.", "info");
-				break;
-			}
-		}
-	}
-
-	// ── Handler: Workflow Complete ──────────────────────────────────
-
-	async function handleWorkflowComplete(
-		pi: ExtensionAPI,
-		ctx: ExtensionContext,
-		state: WorkflowState,
-	): Promise<void> {
-		// Mark all remaining phases as complete
-		for (const phase of state.phases) {
-			phase.status = "complete";
-		}
-		state.currentPhaseIndex = state.phases.length - 1;
-		state.step = "done";
-		state.status = "complete";
-		saveWorkflow(ctx.cwd, state);
-
-		// Final git commit
-		const commitMsg = await commitPhase(pi, ctx.cwd, state);
-		ctx.ui.notify(commitMsg, "info");
-
-		ctx.ui.notify(
-			`🎉 Workflow complete: "${state.task}"\n` +
-				`${state.phases.length} phases finished.\n` +
-				`Plan files in ${state.workflowDir}`,
-			"success",
-		);
-	}
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Key } from "@mariozechner/pi-tui";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const ENTRY_TYPE = "devloop-state";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Slugify a string: lowercase, non-alphanumeric → dash, collapse doubles */
+function slugify(text: string): string {
+    return text
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+}
+
+/** Resolve path to a prompt file bundled with this extension */
+function promptPath(name: string): string {
+    // __dirname is available via jiti for the extension's directory
+    const extDir = dirname(new URL(import.meta.url).pathname);
+    return join(extDir, "..", "prompts", name);
+}
+
+/** Read a prompt file and replace $1 with the slug */
+function assemblePrompt(filename: string, slug: string): string {
+    const template = readFileSync(promptPath(filename), "utf-8");
+    return template.replace(/\$1/g, slug);
+}
+
+/** Read plan.md template, replace $1, and append the user's task after ## TASK */
+function assemblePlanPrompt(slug: string, task: string): string {
+    let template = readFileSync(promptPath("plan.md"), "utf-8");
+    template = template.replace(/\$1/g, slug);
+    // Strip YAML frontmatter before sending to the agent
+    template = template.replace(/^---[\s\S]*?---\n*/, "");
+    // Append task after ## TASK
+    return template + "\n" + task;
+}
+
+/** Read plan-detailed.md template and replace $1 */
+function assemblePlanDetailedPrompt(slug: string): string {
+    const template = readFileSync(promptPath("plan-detailed.md"), "utf-8");
+    // Strip frontmatter
+    const body = template.replace(/^---[\s\S]*?---\n*/, "");
+    return body.replace(/\$1/g, slug);
+}
+
+/** Read implement.md template and replace $1 */
+function assembleImplementPrompt(slug: string): string {
+    const template = readFileSync(promptPath("implement.md"), "utf-8");
+    // Strip frontmatter
+    const body = template.replace(/^---[\s\S]*?---\n*/, "");
+    return body.replace(/\$1/g, slug);
+}
+
+/** Check if the high-level plan file exists on disk */
+function planFileExists(cwd: string, slug: string): boolean {
+    return existsSync(resolve(cwd, ".plans", slug, "high-level.md"));
+}
+
+/** Read the high-level plan file contents */
+function readHighLevelPlan(cwd: string, slug: string): string | null {
+    const path = resolve(cwd, ".plans", slug, "high-level.md");
+    try {
+        return readFileSync(path, "utf-8");
+    } catch {
+        return null;
+    }
+}
+
+// ─── Extension ───────────────────────────────────────────────────────────────
+
+export default function devloopExtension(pi: ExtensionAPI): void {
+    let activeSlug: string | undefined;
+    let needsPlanPrefix = false; // true after /devloop new, cleared after first input
+
+    // ─── State persistence ─────────────────────────────────────────────────
+
+    function persistState(): void {
+        pi.appendEntry(ENTRY_TYPE, {
+            slug: activeSlug,
+            active: !!activeSlug,
+        });
+    }
+
+    function clearState(): void {
+        activeSlug = undefined;
+        needsPlanPrefix = false;
+        persistState();
+    }
+
+    // ─── Session restore ──────────────────────────────────────────────────
+
+    pi.on("session_start", async (_event, ctx) => {
+        activeSlug = undefined;
+
+        const entries = ctx.sessionManager.getEntries();
+        // Find the latest devloop-state entry
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const entry = entries[i];
+            if (
+                entry.type === "custom" &&
+                (entry as any).customType === ENTRY_TYPE
+            ) {
+                const data = (entry as any).data;
+                if (data?.active && data?.slug) {
+                    activeSlug = data.slug;
+                }
+                break;
+            }
+        }
+    });
+
+    // ─── Commands ────────────────────────────────────────────────────────
+
+    pi.registerCommand("devloop-new", {
+        description: "Start a new devloop workflow",
+        getArgumentCompletions: (prefix: string) => {
+            if (!prefix) return [{ value: " ", label: "<task description>" }];
+            return null;
+        },
+        handler: async (args, ctx) => {
+            await handleNew(args.trim(), ctx);
+        },
+    });
+
+    pi.registerCommand("devloop-next", {
+        description: "Show the devloop popup",
+        handler: async (_args, ctx) => {
+            await showDevloopPopup(ctx);
+        },
+    });
+
+    pi.registerCommand("devloop-resume", {
+        description: "Re-attach devloop to a slug (fixes broken state)",
+        getArgumentCompletions: (prefix: string) => {
+            try {
+                const extDir = dirname(new URL(import.meta.url).pathname);
+                // .plans is relative to cwd, but we can't access it here easily
+                // Just return a hint
+                if (!prefix) return [{ value: " ", label: "<slug> (directory name under .plans/)" }];
+            } catch { }
+            return null;
+        },
+        handler: async (args, ctx) => {
+            const slug = args.trim();
+            if (!slug) {
+                ctx.ui.notify("Usage: /devloop-resume <slug>", "warning");
+                return;
+            }
+            if (!planFileExists(ctx.cwd, slug)) {
+                ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
+                return;
+            }
+            activeSlug = slug;
+            persistState();
+            pi.setSessionName(slug);
+            ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
+        },
+    });
+
+    pi.registerCommand("devloop-exit", {
+        description: "Exit the current devloop",
+        handler: async (_args, ctx) => {
+            handleExit(ctx);
+        },
+    });
+
+    pi.registerCommand("devloop-implement", {
+        description: "Hand off to a new session and implement the next phase",
+        handler: async (_args, ctx) => {
+            await handleDoImplement(ctx);
+        },
+    });
+
+    async function handleNew(
+        task: string,
+        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
+    ): Promise<void> {
+        if (!task) {
+            ctx.ui.notify("Usage: /devloop-new <task description>", "warning");
+            return;
+        }
+
+        const slug = slugify(task);
+
+        if (!slug) {
+            ctx.ui.notify("Could not generate a slug from the task description.", "error");
+            return;
+        }
+
+        // Check if plan directory already exists
+        if (existsSync(resolve(ctx.cwd, ".plans", slug))) {
+            ctx.ui.notify(
+                `Plan directory .plans/${slug}/ already exists. Start with a different name.`,
+                "error",
+            );
+            return;
+        }
+
+        // Activate devloop
+        activeSlug = slug;
+        persistState();
+        pi.setSessionName(slug);
+
+        // Mark that the next user input should be prefixed with the plan prompt
+        needsPlanPrefix = true;
+
+        pi.sendMessage({
+            customType: "devloop",
+            content: `DevLoop started: **${slug}**\n\nDescribe your task below and press Enter.`,
+            display: true,
+        }, { triggerTurn: false });
+    }
+
+    function handleExit(
+        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
+    ): void {
+        if (!activeSlug) {
+            ctx.ui.notify("No active devloop to exit.", "info");
+            return;
+        }
+        const slug = activeSlug;
+        clearState();
+        ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
+    }
+
+    async function handleDoImplement(
+        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
+    ): Promise<void> {
+        if (!activeSlug) {
+            ctx.ui.notify("No active devloop.", "error");
+            return;
+        }
+
+        const slug = activeSlug;
+
+        // Read the high-level plan
+        const highLevelPlan = readHighLevelPlan(ctx.cwd, slug);
+        if (!highLevelPlan) {
+            ctx.ui.notify(
+                `No high-level plan found at .plans/${slug}/high-level.md. Accept the plan first.`,
+                "error",
+            );
+            return;
+        }
+
+        // Assemble the implement prompt
+        const implementPrompt = assembleImplementPrompt(slug);
+
+        const currentSessionFile = ctx.sessionManager.getSessionFile();
+
+        // Grab the last assistant message for context
+        const branch = ctx.sessionManager.getBranch();
+        let lastAssistantMsg = "";
+        for (let i = branch.length - 1; i >= 0; i--) {
+            const entry = branch[i];
+            if (entry.type === "message" && (entry as any).message?.role === "assistant") {
+                const content = (entry as any).message.content;
+                if (Array.isArray(content)) {
+                    lastAssistantMsg = content
+                        .filter((c: any) => c.type === "text")
+                        .map((c: any) => c.text)
+                        .join("\n");
+                } else if (typeof content === "string") {
+                    lastAssistantMsg = content;
+                }
+                break;
+            }
+        }
+
+        // Build the full prompt with plan context baked in
+        const fullPrompt = `Here is the high-level plan for the current workflow:
+
+${highLevelPlan}
+
+---
+
+Last assistant message from the planning session:
+
+<last_assistant_msg>
+
+${lastAssistantMsg}
+
+</last_assistant_msg>
+
+---
+
+${implementPrompt}
+
+---
+
+Parent session: ${currentSessionFile}
+You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
+
+        // Create new session with state persisted via setup so session_start can find it
+        const result = await ctx.newSession({
+            parentSession: currentSessionFile,
+            setup: async (sm) => {
+                sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true });
+            },
+        });
+
+        if (result.cancelled) {
+            ctx.ui.notify("Handoff cancelled.", "info");
+            return;
+        }
+
+        pi.setSessionName(slug);
+
+        // Put prompt in editor — user presses Enter to submit
+        ctx.ui.setEditorText(fullPrompt);
+    }
+
+    // ─── Hook: input ──────────────────────────────────────────────────────
+
+    // On the first message after /devloop new, prepend the plan template
+    pi.on("input", async (event, ctx) => {
+        if (!needsPlanPrefix || !activeSlug) return { action: "continue" };
+
+        needsPlanPrefix = false;
+
+        const userText = event.text;
+        const prefix = assemblePlanPrompt(activeSlug, "");
+        const combined = prefix + "\n" + userText;
+
+        return { action: "transform", text: combined };
+    });
+
+    // ─── Popup logic (shared between agent_end, command, shortcut) ────────
+
+    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }): Promise<void> {
+        if (!activeSlug || !ctx.hasUI) return;
+
+        const slug = activeSlug;
+        const planExists = planFileExists(ctx.cwd, slug);
+
+        // Build context-aware options
+        let options: string[];
+        let title: string;
+
+        if (planExists) {
+            title = `DevLoop: ${slug}\n\nFlow: plan-detailed → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            options = [
+                "💬 Free text",
+                "📄 Plan detailed",
+                "🔨 Implement (new session)",
+                "🚪 Exit devloop",
+            ];
+        } else {
+            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → plan-detailed → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            options = [
+                "💬 Free text",
+                "✅ Accept plan (save to disk)",
+                "🚪 Exit devloop",
+            ];
+        }
+
+        const choice = await ctx.ui.select(title, options);
+
+        if (!choice || choice.startsWith("💬 Free text")) {
+            return;
+        }
+
+        if (choice.startsWith("✅ Accept plan")) {
+            pi.sendUserMessage(
+                `The plan looks good. Save it to \`.plans/${slug}/high-level.md\` now.`,
+                { deliverAs: "followUp" },
+            );
+            return;
+        }
+
+        if (choice.startsWith("📄 Plan detailed")) {
+            pi.sendUserMessage(assemblePlanDetailedPrompt(slug), { deliverAs: "followUp" });
+            return;
+        }
+
+        if (choice.startsWith("🔨 Implement")) {
+            ctx.ui.setEditorText("/devloop-implement");
+            return;
+        }
+
+        if (choice.startsWith("🚪 Exit devloop")) {
+            clearState();
+            ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
+            return;
+        }
+    }
+
+    // ─── Hook: agent_end ──────────────────────────────────────────────────
+
+    pi.on("agent_end", async (_event, ctx) => {
+        await showDevloopPopup(ctx);
+    });
+
+    // ("devloop-next" command is handled above)
+
+    // ─── Shortcut: Ctrl+D ────────────────────────────────────────────────
+
+    pi.registerShortcut(Key.ctrl("q"), {
+        description: "Show devloop popup",
+        handler: async (ctx) => {
+            await showDevloopPopup(ctx);
+        },
+    });
 }

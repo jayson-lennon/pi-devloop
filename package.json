@@ -1,10 +1,11 @@
 {
   "name": "devloop",
   "version": "0.1.0",
-  "description": "Phased workflow extension for Pi — plan, review, implement, integrate loop",
+  "description": "Phased workflow extension for Pi — plan, detailed, implement, deviate loop",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./src/index.ts"],
+    "prompts": ["./prompts"]
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
