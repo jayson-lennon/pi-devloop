@@ -14,7 +14,8 @@ If no detailed plan is found. Report to the user "No detailed plan found for pha
 
 1. Follow the detailed plan. Adapt as needed if you encounter unforeseen issues.
 2. After implementation, review the changes.
-3. Update the high-level plan with any required changes to future phases based on the divergence summary. Use markdown strikethrough when editing or removing items from the high-level plan and leave a brief note at the end of the impacted phase section.
+3. Update the high-level plan with any required changes to future phases based on the divergence summary. Use markdown strikethrough when editing or removing items from the high-level plan so we have a record of what changed. Leave a brief note at the end of the impacted phase section when changes are made explaining why.
+4. Mark the phase as complete in the high-level plan.
 
 Here is the format for the review (ALWAYS INCLUDE ALL SECTIONS):
 
