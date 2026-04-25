@@ -5,9 +5,8 @@
  * session handoffs for implementation phases.
  *
  * Commands:
- *   /devloop-new <task>   — Start a new devloop workflow
- *   /devloop-next          — Show the devloop popup
- *   /devloop-implement     — Hand off to new session and implement
+ *   /devloop-new <task>    — Start a new devloop workflow
+ *   /devloop-resume <slug> — Re-attach devloop to an existing plan
  *   /devloop-exit          — Exit the current devloop
  *
  * The extension shows a popup after every agent turn (when active) with
@@ -227,13 +226,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         },
     });
 
-    pi.registerCommand("devloop-next", {
-        description: "Show the devloop popup",
-        handler: async (_args, ctx) => {
-            await showDevloopPopup(ctx);
-        },
-    });
-
     pi.registerCommand("devloop-resume", {
         description: "Re-attach devloop to a slug (fixes broken state)",
         getArgumentCompletions: (prefix: string) => {
@@ -262,13 +254,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         description: "Exit the current devloop",
         handler: async (_args, ctx) => {
             handleExit(ctx);
-        },
-    });
-
-    pi.registerCommand("devloop-implement", {
-        description: "Hand off to new session and implement the next phase",
-        handler: async (_args, ctx) => {
-            await handleDoImplement(ctx);
         },
     });
 
@@ -432,7 +417,7 @@ You can use the session_query tool with this path to look up decisions, discussi
             options = [
                 "💬 Free text",
                 "📄 Make detailed plan",
-                "🔨 Implement (new session)",
+                "🔨 Implement",
                 "🚪 Exit devloop",
             ];
         } else {
@@ -464,7 +449,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         }
 
         if (choice.startsWith("🔨 Implement")) {
-            ctx.ui.setEditorText("/devloop-implement");
+            await handleDoImplement(ctx);
             return;
         }
 
