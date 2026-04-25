@@ -12,9 +12,11 @@
  *
  * The extension shows a popup after every agent turn (when active) with
  * context-aware options based on whether the high-level plan exists on disk.
+ *
+ * A persistent widget shows phase progress above the editor when a devloop is active.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -22,6 +24,7 @@ import { dirname, join, resolve } from "node:path";
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const ENTRY_TYPE = "devloop-state";
+const WIDGET_ID = "devloop-progress";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -35,7 +38,6 @@ function slugify(text: string): string {
 
 /** Resolve path to a prompt file bundled with this extension */
 function promptPath(name: string): string {
-    // __dirname is available via jiti for the extension's directory
     const extDir = dirname(new URL(import.meta.url).pathname);
     return join(extDir, "..", "prompts", name);
 }
@@ -50,16 +52,13 @@ function assemblePrompt(filename: string, slug: string): string {
 function assemblePlanPrompt(slug: string, task: string): string {
     let template = readFileSync(promptPath("plan.md"), "utf-8");
     template = template.replace(/\$1/g, slug);
-    // Strip YAML frontmatter before sending to the agent
     template = template.replace(/^---[\s\S]*?---\n*/, "");
-    // Append task after ## TASK
     return template + "\n" + task;
 }
 
 /** Read plan-detailed.md template and replace $1 */
 function assemblePlanDetailedPrompt(slug: string): string {
     const template = readFileSync(promptPath("plan-detailed.md"), "utf-8");
-    // Strip frontmatter
     const body = template.replace(/^---[\s\S]*?---\n*/, "");
     return body.replace(/\$1/g, slug);
 }
@@ -67,7 +66,6 @@ function assemblePlanDetailedPrompt(slug: string): string {
 /** Read implement.md template and replace $1 */
 function assembleImplementPrompt(slug: string): string {
     const template = readFileSync(promptPath("implement.md"), "utf-8");
-    // Strip frontmatter
     const body = template.replace(/^---[\s\S]*?---\n*/, "");
     return body.replace(/\$1/g, slug);
 }
@@ -87,11 +85,93 @@ function readHighLevelPlan(cwd: string, slug: string): string | null {
     }
 }
 
+// ─── Phase Parsing ───────────────────────────────────────────────────────────
+
+interface PhaseInfo {
+    index: number;
+    name: string;
+    done: boolean;
+}
+
+function parsePhases(planContent: string): PhaseInfo[] {
+    const phases: PhaseInfo[] = [];
+    const regex = /^- \[([ xX])\] Phase (\d+): (.+)$/gm;
+    let match;
+    while ((match = regex.exec(planContent)) !== null) {
+        phases.push({
+            index: parseInt(match[2]!, 10),
+            name: match[3]!.trim(),
+            done: match[1]!.toLowerCase() === "x",
+        });
+    }
+    return phases;
+}
+
+/** Render phase progress lines using theme colors */
+function renderProgressLines(theme: Theme, slug: string, phases: PhaseInfo[], workflowStep: string): string[] {
+    const th = theme;
+    const lines: string[] = [];
+
+    lines.push(th.fg("accent", th.bold("DevLoop")) + th.fg("dim", `: ${slug}`));
+
+    if (phases.length > 0) {
+        const completed = phases.filter((p) => p.done).length;
+        const total = phases.length;
+        const barWidth = 12;
+        const filled = Math.round((completed / total) * barWidth);
+        const empty = barWidth - filled;
+        const bar = th.fg("success", "█".repeat(filled)) + th.fg("dim", "░".repeat(empty));
+        const count = th.fg("dim", `${completed}/${total}`);
+        lines.push(` ${bar} ${count}`);
+
+        for (const phase of phases) {
+            const icon = phase.done ? th.fg("success", "✓") : th.fg("dim", "○");
+            const name = phase.done ? th.fg("dim", phase.name) : th.fg("text", phase.name);
+            const num = th.fg("accent", `P${phase.index}`);
+            lines.push(` ${icon} ${num} ${name}`);
+        }
+    } else {
+        lines.push(th.fg("dim", " No phases yet"));
+    }
+
+    const stepIcon = workflowStep === "complete" ? th.fg("success", "✓") : th.fg("warning", "⚙");
+    lines.push(` ${stepIcon} ${workflowStep}`);
+
+    return lines;
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function devloopExtension(pi: ExtensionAPI): void {
     let activeSlug: string | undefined;
-    let needsPlanPrefix = false; // true after /devloop new, cleared after first input
+    let needsPlanPrefix = false;
+
+    // ─── Widget management ──────────────────────────────────────────────
+
+    function refreshWidget(ctx: { cwd: string; hasUI: boolean; ui: any }): void {
+        if (!activeSlug || !ctx.hasUI) return;
+
+        const planContent = readHighLevelPlan(ctx.cwd, activeSlug);
+        const phases = planContent ? parsePhases(planContent) : [];
+
+        let workflowStep: string;
+        if (phases.length === 0) {
+            workflowStep = "planning";
+        } else if (phases.every((p) => p.done)) {
+            workflowStep = "complete";
+        } else {
+            workflowStep = "implementing";
+        }
+
+        const lines = renderProgressLines(ctx.ui.theme, activeSlug, phases, workflowStep);
+        ctx.ui.setWidget(WIDGET_ID, lines);
+    }
+
+    function clearWidget(ctx: { hasUI: boolean; ui: any }): void {
+        if (ctx.hasUI) {
+            ctx.ui.setWidget(WIDGET_ID, undefined);
+        }
+    }
 
     // ─── State persistence ─────────────────────────────────────────────────
 
@@ -102,9 +182,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         });
     }
 
-    function clearState(): void {
+    function clearState(ctx: { hasUI: boolean; ui: any }): void {
         activeSlug = undefined;
         needsPlanPrefix = false;
+        clearWidget(ctx);
         persistState();
     }
 
@@ -114,7 +195,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         activeSlug = undefined;
 
         const entries = ctx.sessionManager.getEntries();
-        // Find the latest devloop-state entry
         for (let i = entries.length - 1; i >= 0; i--) {
             const entry = entries[i];
             if (
@@ -127,6 +207,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
                 }
                 break;
             }
+        }
+
+        if (activeSlug) {
+            refreshWidget(ctx);
         }
     });
 
@@ -153,12 +237,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     pi.registerCommand("devloop-resume", {
         description: "Re-attach devloop to a slug (fixes broken state)",
         getArgumentCompletions: (prefix: string) => {
-            try {
-                const extDir = dirname(new URL(import.meta.url).pathname);
-                // .plans is relative to cwd, but we can't access it here easily
-                // Just return a hint
-                if (!prefix) return [{ value: " ", label: "<slug> (directory name under .plans/)" }];
-            } catch { }
+            if (!prefix) return [{ value: " ", label: "<slug> (directory name under .plans/)" }];
             return null;
         },
         handler: async (args, ctx) => {
@@ -173,6 +252,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             }
             activeSlug = slug;
             persistState();
+            refreshWidget(ctx);
             pi.setSessionName(slug);
             ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
         },
@@ -186,7 +266,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     });
 
     pi.registerCommand("devloop-implement", {
-        description: "Hand off to a new session and implement the next phase",
+        description: "Hand off to new session and implement the next phase",
         handler: async (_args, ctx) => {
             await handleDoImplement(ctx);
         },
@@ -208,7 +288,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return;
         }
 
-        // Check if plan directory already exists
         if (existsSync(resolve(ctx.cwd, ".plans", slug))) {
             ctx.ui.notify(
                 `Plan directory .plans/${slug}/ already exists. Start with a different name.`,
@@ -217,12 +296,11 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return;
         }
 
-        // Activate devloop
         activeSlug = slug;
         persistState();
+        refreshWidget(ctx);
         pi.setSessionName(slug);
 
-        // Mark that the next user input should be prefixed with the plan prompt
         needsPlanPrefix = true;
 
         pi.sendMessage({
@@ -240,7 +318,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return;
         }
         const slug = activeSlug;
-        clearState();
+        clearState(ctx);
         ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
     }
 
@@ -254,7 +332,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
         const slug = activeSlug;
 
-        // Read the high-level plan
         const highLevelPlan = readHighLevelPlan(ctx.cwd, slug);
         if (!highLevelPlan) {
             ctx.ui.notify(
@@ -264,12 +341,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return;
         }
 
-        // Assemble the implement prompt
         const implementPrompt = assembleImplementPrompt(slug);
 
         const currentSessionFile = ctx.sessionManager.getSessionFile();
 
-        // Grab the last assistant message for context
         const branch = ctx.sessionManager.getBranch();
         let lastAssistantMsg = "";
         for (let i = branch.length - 1; i >= 0; i--) {
@@ -288,7 +363,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             }
         }
 
-        // Build the full prompt with plan context baked in
         const fullPrompt = `Here is the high-level plan for the current workflow:
 
 ${highLevelPlan}
@@ -312,7 +386,6 @@ ${implementPrompt}
 Parent session: ${currentSessionFile}
 You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
 
-        // Create new session with state persisted via setup so session_start can find it
         const result = await ctx.newSession({
             parentSession: currentSessionFile,
             setup: async (sm) => {
@@ -326,14 +399,11 @@ You can use the session_query tool with this path to look up decisions, discussi
         }
 
         pi.setSessionName(slug);
-
-        // Put prompt in editor — user presses Enter to submit
         ctx.ui.setEditorText(fullPrompt);
     }
 
     // ─── Hook: input ──────────────────────────────────────────────────────
 
-    // On the first message after /devloop new, prepend the plan template
     pi.on("input", async (event, ctx) => {
         if (!needsPlanPrefix || !activeSlug) return { action: "continue" };
 
@@ -354,7 +424,6 @@ You can use the session_query tool with this path to look up decisions, discussi
         const slug = activeSlug;
         const planExists = planFileExists(ctx.cwd, slug);
 
-        // Build context-aware options
         let options: string[];
         let title: string;
 
@@ -400,7 +469,7 @@ You can use the session_query tool with this path to look up decisions, discussi
         }
 
         if (choice.startsWith("🚪 Exit devloop")) {
-            clearState();
+            clearState(ctx);
             ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
             return;
         }
@@ -409,16 +478,16 @@ You can use the session_query tool with this path to look up decisions, discussi
     // ─── Hook: agent_end ──────────────────────────────────────────────────
 
     pi.on("agent_end", async (_event, ctx) => {
+        refreshWidget(ctx);
         await showDevloopPopup(ctx);
     });
 
-    // ("devloop-next" command is handled above)
-
-    // ─── Shortcut: Ctrl+D ────────────────────────────────────────────────
+    // ─── Shortcut: Ctrl+Q ────────────────────────────────────────────────────
 
     pi.registerShortcut(Key.ctrl("q"), {
         description: "Show devloop popup",
         handler: async (ctx) => {
+            refreshWidget(ctx);
             await showDevloopPopup(ctx);
         },
     });
