@@ -6,9 +6,6 @@
  *
  * Commands:
  *   /devloop new <task>    — Start a new devloop workflow
- *   /devloop resume [slug] — Re-attach devloop to an existing plan (auto-detects if omitted)
- *   /devloop exit          — Exit the current devloop
- *   /devloop _implement    — (internal) Hand off to new session
  *
  * The extension shows a popup after every agent turn (when active) with
  * context-aware options based on whether the high-level plan exists on disk.
@@ -120,11 +117,23 @@
  *      (because session_start in the NEW instance resets closure state).
  *      The captured boolean is plain data — it survives the closure
  *      boundary fine since withSession runs in the ORIGINAL closure.
+ *
+ * ── Permanent session binding ───────────────────────────────────────────
+ *
+ * Once a session is bound to a devloop slug (via /devloop new), it is
+ * PERMANENTLY a devloop session. There is no "exit" or "pause" concept.
+ * The slug persists in the custom entry forever. When the devloop completes
+ * all phases, the popup shows "Implementation complete" with just a "talk
+ * to agent" option. The user can keep chatting in the session normally.
+ *
+ * Returning to a devloop session is handled by Pi's built-in /resume — the
+ * session_start handler automatically restores the slug and widget from the
+ * custom entry. No separate /devloop resume command is needed.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -146,12 +155,6 @@ function slugify(text: string): string {
 function promptPath(name: string): string {
     const extDir = dirname(new URL(import.meta.url).pathname);
     return join(extDir, "..", "prompts", name);
-}
-
-/** Read a prompt file and replace $1 with the slug */
-function assemblePrompt(filename: string, slug: string): string {
-    const template = readFileSync(promptPath(filename), "utf-8");
-    return template.replace(/\$1/g, slug);
 }
 
 /** Read plan.md template, replace $1, and append the user's task after ## TASK */
@@ -188,20 +191,6 @@ function readHighLevelPlan(cwd: string, slug: string): string | null {
         return readFileSync(path, "utf-8");
     } catch {
         return null;
-    }
-}
-
-/** Discover all plan slugs that have a high-level.md on disk */
-function discoverPlanSlugs(cwd: string): string[] {
-    const plansDir = resolve(cwd, ".plans");
-    if (!existsSync(plansDir)) return [];
-    try {
-        return readdirSync(plansDir, { withFileTypes: true })
-            .filter((d) => d.isDirectory() && existsSync(resolve(plansDir, d.name, "high-level.md")))
-            .map((d) => d.name)
-            .sort();
-    } catch {
-        return [];
     }
 }
 
@@ -304,6 +293,9 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     // See the module-level doc "State persistence across sessions" for how
     // state survives via custom entries + session_start restore.
     //
+    // activeSlug is PERMANENT — once set by /devloop new, it never clears.
+    // A session is forever a devloop session. There is no exit/pause.
+    //
     let activeSlug: string | undefined;
     let needsPlanPrefix = false;
     let autoMode = false;
@@ -367,13 +359,13 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         });
     }
 
-    function clearState(ctx: { hasUI: boolean; ui: any }): void {
-        activeSlug = undefined;
-        needsPlanPrefix = false;
+    /** Mark devloop as complete — slug stays bound, auto/manual mode off */
+    function markComplete(ctx: { hasUI: boolean; ui: any }): void {
         autoMode = false;
-        cachedCmdCtx = undefined;  // Invalidate cached context
-        clearWidget(ctx);
-        persistState();
+        needsPlanPrefix = false;
+        cachedCmdCtx = undefined;
+        persistState();  // writes { slug, active: true, autoMode: false } — slug persists
+        refreshWidget(ctx);
     }
 
     // ─── Auto-loop drive logic ─────────────────────────────────────────────
@@ -381,7 +373,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     // driveAutoLoop is called from agent_end when autoMode is true.
     // It determines the next step (plan / implement / complete) and dispatches.
     //
-    // For "plan" and "complete", it can act directly (sendUserMessage or clearState).
+    // For "plan" and "complete", it can act directly (sendUserMessage or markComplete).
     //
     // For "implement", it CANNOT call ctx.newSession() directly because:
     //   - The ctx passed to agent_end is ExtensionContext, not ExtensionCommandContext
@@ -404,7 +396,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             const slug = activeSlug;
             autoMode = false;
             persistState();
-            clearWidget(ctx);
+            refreshWidget(ctx);
             if (ctx.hasUI) {
                 ctx.ui.notify(
                     `Auto-loop aborted: context utilization exceeded 70% in "${slug}". Switch to manual or compact the session.`,
@@ -418,10 +410,9 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
         switch (nextStep) {
             case "complete": {
-                const slug = activeSlug;
-                clearState(ctx);
+                markComplete(ctx);
                 if (ctx.hasUI) {
-                    ctx.ui.notify(`Auto-loop complete — all phases done for "${slug}".`, "success");
+                    ctx.ui.notify(`Auto-loop complete — all phases done for "${activeSlug}".`, "success");
                 }
                 return;
             }
@@ -485,7 +476,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         await handleDoImplement(cachedCmdCtx);
     });
 
-    pi.events.on("devloop:auto-implement", () => {
+    // "Auto mode" — enables auto + drives the loop immediately.
+    // Consolidates the old "auto-implement", "switch-auto", and "continue-auto"
+    // events into a single action: "take it from here."
+    pi.events.on("devloop:auto", () => {
         if (!activeSlug) return;
         autoMode = true;
         persistState();
@@ -493,22 +487,8 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         driveAutoLoop(cachedCmdCtx ?? { cwd: "", hasUI: false, ui: null, getContextUsage: () => null });
     });
 
-    pi.events.on("devloop:switch-auto", () => {
-        if (!activeSlug) return;
-        autoMode = true;
-        persistState();
-        if (cachedCmdCtx) {
-            refreshWidget(cachedCmdCtx);
-            cachedCmdCtx.ui.notify("Auto mode enabled. The loop will drive automatically.", "info");
-        }
-    });
-
-    pi.events.on("devloop:continue-auto", () => {
-        if (!activeSlug) return;
-        driveAutoLoop(cachedCmdCtx ?? { cwd: "", hasUI: false, ui: null, getContextUsage: () => null });
-    });
-
-    pi.events.on("devloop:switch-manual", () => {
+    // "Manual mode" — disables auto, user drives via popup.
+    pi.events.on("devloop:manual", () => {
         autoMode = false;
         persistState();
         if (cachedCmdCtx) {
@@ -516,23 +496,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             cachedCmdCtx.ui.notify("Switched to manual mode.", "info");
         }
     });
-
-    pi.events.on("devloop:exit", () => {
-        if (!cachedCmdCtx) return;
-        const slug = activeSlug;
-        clearState(cachedCmdCtx);
-        cachedCmdCtx.ui.notify(`DevLoop "${slug}" exited.`, "info");
-    });
-
-    // ─── Resume helper ──────────────────────────────────────────────────
-
-    function resumeWithSlug(slug: string, ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1]): void {
-        activeSlug = slug;
-        persistState();
-        refreshWidget(ctx);
-        pi.setSessionName(slug);
-        ctx.ui.notify(`DevLoop resumed: **${slug}**`, "info");
-    }
 
     // ─── Session restore ──────────────────────────────────────────────────
     //
@@ -543,6 +506,11 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     // This handler restores state by reading the custom entry that was written
     // in the setup callback of ctx.newSession(). It scans entries in reverse
     // to find the most recent devloop-state entry.
+    //
+    // IMPORTANT: We ALWAYS restore the slug — even when active is false.
+    // A session is permanently a devloop session. The slug binding never goes
+    // away. Only autoMode toggles. This means returning to a completed
+    // devloop session (via Pi's /resume) restores the widget in its final state.
     //
     // LIFECYCLE during session replacement:
     //   1. ctx.newSession() is called (in handleDoImplement)
@@ -571,7 +539,9 @@ export default function devloopExtension(pi: ExtensionAPI): void {
                 (entry as any).customType === ENTRY_TYPE
             ) {
                 const data = (entry as any).data;
-                if (data?.active && data?.slug) {
+                // Always restore slug — even if active is false.
+                // The session is permanently bound to this devloop.
+                if (data?.slug) {
                     activeSlug = data.slug;
                     autoMode = !!data.autoMode;
                 }
@@ -589,14 +559,15 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     // The /devloop command handler is the entry point for all user-triggered
     // actions AND the place where we cache the ExtensionCommandContext.
     //
+    // Only one subcommand exists: /devloop new <task>
+    // All other interaction happens via the popup (Ctrl+Q) or auto-loop.
+    //
 
     pi.registerCommand("devloop", {
         description: "DevLoop workflow commands",
         getArgumentCompletions: (prefix: string) => {
             const subcommands = [
                 { value: "new ", label: "new <task> — Start a new devloop workflow" },
-                { value: "resume ", label: "resume [slug] — Re-attach devloop to an existing plan (auto-detects if omitted)" },
-                { value: "exit", label: "exit — Exit the current devloop" },
             ];
             if (!prefix) return subcommands;
             return subcommands.filter((s) => s.value.startsWith(prefix));
@@ -612,45 +583,8 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
             if (sub === "new") {
                 await handleNew(rest, ctx);
-            } else if (sub === "resume") {
-                const raw = rest.trim();
-
-                if (raw) {
-                    // Explicit slug provided — existing behavior
-                    const slug = slugify(raw);
-                    if (!planFileExists(ctx.cwd, slug)) {
-                        ctx.ui.notify(`No plan found at .plans/${slug}/high-level.md`, "error");
-                        return;
-                    }
-                    resumeWithSlug(slug, ctx);
-                } else {
-                    // No args — auto-detect from .plans/*/high-level.md
-                    const slugs = discoverPlanSlugs(ctx.cwd);
-
-                    if (slugs.length === 0) {
-                        ctx.ui.notify("No plans found in .plans/. Create one with /devloop new.", "error");
-                        return;
-                    }
-
-                    if (slugs.length === 1) {
-                        resumeWithSlug(slugs[0], ctx);
-                        return;
-                    }
-
-                    // Multiple matches — show picker
-                    const choice = await ctx.ui.select(
-                        "Multiple plans found. Select one to resume:",
-                        slugs,
-                    );
-                    if (!choice) return;  // User dismissed picker
-                    resumeWithSlug(choice, ctx);
-                }
-            } else if (sub === "_implement") {
-                await handleDoImplement(ctx);
-            } else if (sub === "exit") {
-                handleExit(ctx);
             } else {
-                ctx.ui.notify("Usage: /devloop <new|resume|exit> [args]. Try /devloop resume to auto-detect.", "warning");
+                ctx.ui.notify("Usage: /devloop new <task description>", "warning");
             }
         },
     });
@@ -660,7 +594,17 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
     ): Promise<void> {
         if (!task) {
-            ctx.ui.notify("Usage: /devloop-new <task description>", "warning");
+            ctx.ui.notify("Usage: /devloop new <task description>", "warning");
+            return;
+        }
+
+        // Reject if this session is already bound to a devloop.
+        // Sessions are permanently bound — use a new Pi session for a different devloop.
+        if (activeSlug) {
+            ctx.ui.notify(
+                `This session is already bound to devloop "${activeSlug}". Start a new Pi session for a different devloop.`,
+                "warning",
+            );
             return;
         }
 
@@ -691,18 +635,6 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             content: `DevLoop started: **${slug}**\n\nDescribe your task below and press Enter.`,
             display: true,
         }, { triggerTurn: false });
-    }
-
-    function handleExit(
-        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
-    ): void {
-        if (!activeSlug) {
-            ctx.ui.notify("No active devloop to exit.", "info");
-            return;
-        }
-        const slug = activeSlug;
-        clearState(ctx);
-        ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
     }
 
     // ─── handleDoImplement: Session handoff ────────────────────────────
@@ -751,6 +683,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     // is on the stale pi object and ReplacedSessionContext doesn't have it.
     // Prompt delivery > cosmetic session name.
     //
+    async function handleDoImplement(
         ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
     ): Promise<void> {
         if (!activeSlug) {
@@ -868,41 +801,63 @@ You can use the session_query tool with this path to look up decisions, discussi
         return { action: "transform", text: combined };
     });
 
-    // ─── Popup logic (shared between agent_end, command, shortcut) ────────
+    // ─── Popup logic ─────────────────────────────────────────────────────
+    //
+    // The popup shows context-aware options after every agent turn.
+    // Options depend on the current state: what files exist on disk,
+    // whether auto mode is on, and whether all phases are complete.
+    //
+    // There are four popup states:
+    //
+    //   COMPLETE (all phases done):
+    //     Title says "Implementation complete". Only option is "talk to agent."
+    //     The widget stays visible showing all phases checked off.
+    //
+    //   AUTO (auto mode on, phases remain):
+    //     Only option is "switch to manual." Auto drives itself.
+    //
+    //   PRE-PLAN (manual, no high-level plan on disk yet):
+    //     Accept the plan (with or without auto), or talk to agent.
+    //
+    //   POST-PLAN (manual, plan exists, phases remain):
+    //     Make detailed plan, implement, enable auto, or talk to agent.
+    //
 
-    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }, paused = false): Promise<void> {
+    async function showDevloopPopup(ctx: { cwd: string; hasUI: boolean; ui: any }): Promise<void> {
         if (!activeSlug || !ctx.hasUI) return;
 
         const slug = activeSlug;
         const planExists = planFileExists(ctx.cwd, slug);
+        const { workflowStep } = getWorkflowStatus(ctx.cwd);
 
         let options: string[];
         let title: string;
 
-        if (autoMode) {
-            title = `DevLoop: ${slug} ⚙ Auto Mode\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+        if (workflowStep === "complete") {
+            // All phases done — show minimal popup
+            title = `DevLoop: ${slug} — Implementation complete\n\nAll phases are done. The session is still bound to this devloop.`;
             options = [
-                ...(paused ? ["▶ Continue auto-loop"] : []),
+                "💬 Talk to the agent",
+            ];
+        } else if (autoMode) {
+            title = `DevLoop: ${slug} ⚙ Auto Mode\n\nAuto mode is driving the loop. Switch to manual to pick actions yourself.`;
+            options = [
                 "🖐 Switch to manual",
-                "🚪 Exit devloop",
             ];
         } else if (!planExists) {
-            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat`;
             options = [
                 "💬 Talk to the agent",
                 "✅ Accept plan",
-                "✅ Accept & Auto-Implement",
-                "🚪 Exit devloop",
+                "✅ Accept plan & Auto mode",
             ];
         } else {
-            title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat`;
             options = [
                 "💬 Talk to the agent",
                 "📄 Make detailed plan",
-                "🔨 Implement (press enter 3 times)",
-                "⚡ Auto-Implement",
-                "⚡ Switch to auto",
-                "🚪 Exit devloop",
+                "🔨 Implement (new session)",
+                "⚡ Auto mode",
             ];
         }
 
@@ -914,7 +869,7 @@ You can use the session_query tool with this path to look up decisions, discussi
 
         // ── Emit events for all actions ──
 
-        if (choice.startsWith("✅ Accept & Auto-Implement")) {
+        if (choice.startsWith("✅ Accept plan & Auto mode")) {
             pi.events.emit("devloop:accept-and-auto");
             return;
         }
@@ -934,28 +889,13 @@ You can use the session_query tool with this path to look up decisions, discussi
             return;
         }
 
-        if (choice.startsWith("⚡ Auto-Implement")) {
-            pi.events.emit("devloop:auto-implement");
-            return;
-        }
-
-        if (choice.startsWith("⚡ Switch to auto")) {
-            pi.events.emit("devloop:switch-auto");
-            return;
-        }
-
-        if (choice.startsWith("▶ Continue auto-loop")) {
-            pi.events.emit("devloop:continue-auto");
+        if (choice.startsWith("⚡ Auto mode")) {
+            pi.events.emit("devloop:auto");
             return;
         }
 
         if (choice.startsWith("🖐 Switch to manual")) {
-            pi.events.emit("devloop:switch-manual");
-            return;
-        }
-
-        if (choice.startsWith("🚪 Exit devloop")) {
-            pi.events.emit("devloop:exit");
+            pi.events.emit("devloop:manual");
             return;
         }
     }
@@ -969,11 +909,10 @@ You can use the session_query tool with this path to look up decisions, discussi
 
         const { workflowStep } = getWorkflowStatus(ctx.cwd);
 
-        // Auto-exit when all phases are complete
+        // All phases complete — mark done and show completion popup
         if (workflowStep === "complete") {
-            const slug = activeSlug;
-            clearState(ctx);
-            ctx.ui.notify(`DevLoop "${slug}" complete — all phases done.`, "success");
+            markComplete(ctx);
+            await showDevloopPopup(ctx);
             return;
         }
 
@@ -992,8 +931,9 @@ You can use the session_query tool with this path to look up decisions, discussi
                 driveAutoLoop(ctx);
                 return;
             }
-            // Turn was aborted (user hit ESC) — paused. Show popup with "Continue" option.
-            await showDevloopPopup(ctx, true);
+            // Turn was aborted (user hit ESC) — show popup so they can
+            // decide whether to keep driving or switch to manual.
+            await showDevloopPopup(ctx);
             return;
         }
 
