@@ -428,18 +428,18 @@ You can use the session_query tool with this path to look up decisions, discussi
         let title: string;
 
         if (planExists) {
-            title = `DevLoop: ${slug}\n\nFlow: plan-detailed → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            title = `DevLoop: ${slug}\n\nFlow: make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 "💬 Free text",
-                "📄 Plan detailed",
+                "📄 Make detailed plan",
                 "🔨 Implement (new session)",
                 "🚪 Exit devloop",
             ];
         } else {
-            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → plan-detailed → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
+            title = `DevLoop: ${slug}\n\nFlow: propose plan → accept → make detailed plan → implement → repeat\n\nPress Esc to dismiss. Use Ctrl+Q to show this popup again.`;
             options = [
                 "💬 Free text",
-                "✅ Accept plan (save to disk)",
+                "✅ Accept plan",
                 "🚪 Exit devloop",
             ];
         }
@@ -458,7 +458,7 @@ You can use the session_query tool with this path to look up decisions, discussi
             return;
         }
 
-        if (choice.startsWith("📄 Plan detailed")) {
+        if (choice.startsWith("📄 Make detailed plan")) {
             pi.sendUserMessage(assemblePlanDetailedPrompt(slug), { deliverAs: "followUp" });
             return;
         }
