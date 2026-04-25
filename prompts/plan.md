@@ -14,7 +14,7 @@ DO NOT IMPLEMENT THE PLAN. WAIT FOR USER APPROVAL.
 3. Ask clarifying questions to address ambiguities in the request
 4. Once the user answers all the questions, propose the plan to the user as a chat response. DO NOT SAVE TO DISK.
 5. After the user accepts the plan, write it to `.plans/$1/high-level.md`
-6. Report to the user "High-level plan created. Generate a detailed plan next"
+6. Report to the user "High-level plan created. Please select 'Make detailed plan' to start loop."
 
 ## Notes
 
