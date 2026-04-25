@@ -10,9 +10,9 @@ DO NOT IMPLEMENT THE PLAN. WAIT FOR USER APPROVAL.
 ## Instructions
 
 1. Explore the problem space to understand the request
-2. Break the work into numbered phases. Don't assign phases to trivial changes - merge them together until the phase is significant.
+2. Break the work into non-trivial numbered phases.
 3. Ask clarifying questions to address ambiguities in the request
-4. Once the user answers all the questions, propose the plan to the user as a chat response. DO NOT SAVE TO DISK.
+4. After the user answers all the questions, review the phases and determine if they can be reduced or merged into fewer phases, and then propose the plan to the user as a chat response. DO NOT SAVE TO DISK.
 5. After the user accepts the plan, write it to `.plans/$1/high-level.md`
 6. Report to the user "High-level plan created. Please select 'Make detailed plan' to start loop."
 
