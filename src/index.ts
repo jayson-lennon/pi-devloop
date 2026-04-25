@@ -596,7 +596,9 @@ You can use the session_query tool with this path to look up decisions, discussi
             withSession: async (newCtx) => {
                 // withSession runs after session replacement: old pi/ctx are stale.
                 // Use only newCtx for session-bound work.
-                pi.setSessionName(slug);
+                //
+                // NOTE: pi.setSessionName(slug) would throw here — pi is stale.
+                // Session name is less important than getting the prompt delivered.
 
                 if (shouldAutoSubmit) {
                     await newCtx.sendUserMessage(fullPrompt);
