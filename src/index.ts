@@ -14,6 +14,112 @@
  * context-aware options based on whether the high-level plan exists on disk.
  *
  * A persistent widget shows phase progress above the editor when a devloop is active.
+ *
+ * ── Architecture: Why the event bus + cachedCmdCtx pattern? ──────────────
+ *
+ * Pi extensions have TWO context types with different capabilities:
+ *
+ *   ExtensionContext     — available in event hooks (agent_end, session_start, etc.)
+ *                          Has: cwd, ui, getContextUsage()
+ *                          Lacks: newSession(), sendUserMessage()
+ *
+ *   ExtensionCommandContext — available in /command handlers
+ *                             Has everything ExtensionContext has, PLUS:
+ *                             newSession(), sessionManager, model, isIdle()
+ *
+ * The auto-loop needs to call newSession() when it's time to implement, but
+ * it's triggered from agent_end which only gives us ExtensionContext.
+ *
+ * APPROACHES THAT DO NOT WORK:
+ *
+ *   ❌ pi.sendUserMessage("/devloop _implement")
+ *      sendUserMessage sends raw TEXT, not a command. Pi does NOT re-parse
+ *      user messages as slash commands. The text literally goes to the LLM
+ *      as if the user typed it — the LLM sees "/devloop _implement" and has
+ *      no idea what to do with it.
+ *
+ *   ❌ Calling ctx.newSession() from inside an agent_end handler
+ *      agent_end gives ExtensionContext, not ExtensionCommandContext.
+ *      newSession() only exists on ExtensionCommandContext. TypeScript won't
+ *      even compile this.
+ *
+ *   ❌ Using pi.sendMessage() with triggerTurn to invoke the command
+ *      sendMessage sends a custom/assistant-style message, not a command.
+ *      It doesn't route through the command handler.
+ *
+ * WHAT WORKS: The event bus bridge.
+ *
+ *   1. Every /devloop command handler runs, we cache its ctx as cachedCmdCtx.
+ *      This is a ExtensionCommandContext — it has newSession().
+ *
+ *   2. When agent_end fires and driveAutoLoop needs to implement, it emits
+ *      pi.events.emit("devloop:implement", { slug }).
+ *
+ *   3. The event handler (registered during setup) calls
+ *      handleDoImplement(cachedCmdCtx) — using the cached command context
+ *      which HAS newSession().
+ *
+ *   4. handleDoImplement calls ctx.newSession() on that cached context.
+ *
+ * This is ugly but necessary given Pi's context split. The handoff.ts
+ * example in Pi's examples directory does the same thing (minus the event
+ * bus, because it's user-triggered from a command, not auto-triggered from
+ * an event hook).
+ *
+ * ── Session replacement: The withSession minefield ──────────────────────
+ *
+ * ctx.newSession() does NOT simply return a new context. It REPLACES the
+ * current session. After it completes:
+ *
+ *   - The old session is destroyed (session_shutdown fires)
+ *   - A new session is created (session_start fires)
+ *   - The old pi object and old ctx are STALE — any session-bound call
+ *     on them will THROW
+ *
+ * DO NOT DO THESE THINGS after ctx.newSession() resolves:
+ *
+ *   ❌ pi.sendUserMessage(prompt)        — stale pi, throws
+ *   ❌ pi.setSessionName(name)            — stale pi, throws
+ *   ❌ ctx.ui.setEditorText(text)          — stale ctx, throws
+ *   ❌ ctx.sessionManager.anything()       — stale ctx, throws
+ *
+ * INSTEAD, use the withSession callback:
+ *
+ *   await ctx.newSession({
+ *       setup: async (sm) => { ... },      // runs before replacement
+ *       withSession: async (newCtx) => {    // newCtx is fresh
+ *           await newCtx.sendUserMessage(prompt);  // ✅ works
+ *           newCtx.ui.setEditorText(text);          // ✅ works
+ *           // pi.setSessionName(name);             // ❌ STILL stale pi!
+ *       },
+ *   });
+ *
+ * IMPORTANT: Even inside withSession, the captured `pi` is stale.
+ * Only `newCtx` (the ReplacedSessionContext) is safe. It extends
+ * ExtensionCommandContext with sendUserMessage() and sendMessage().
+ * But it does NOT have setSessionName — that's only on `pi`.
+ *
+ * This is why handleDoImplement does NOT call pi.setSessionName() inside
+ * withSession. We traded the cosmetic session name for actually working
+ * prompt delivery. If Pi adds setSessionName to ReplacedSessionContext
+ * in the future, we can restore it.
+ *
+ * ── State persistence across sessions ───────────────────────────────────
+ *
+ * Extension closure state (activeSlug, autoMode, etc.) is per-instance.
+ * When a new session is created, a NEW extension instance is created and
+ * the old one is destroyed. State survives via:
+ *
+ *   1. setup callback: sm.appendCustomEntry() writes state into the new
+ *      session's entry log before it goes live.
+ *
+ *   2. session_start handler: reads the custom entry back out and
+ *      restores activeSlug/autoMode.
+ *
+ *   3. withSession: captures shouldAutoSubmit BEFORE the session switch
+ *      (because session_start in the NEW instance resets closure state).
+ *      The captured boolean is plain data — it survives the closure
+ *      boundary fine since withSession runs in the ORIGINAL closure.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
@@ -192,9 +298,28 @@ function deriveNextStep(cwd: string, slug: string): NextStep {
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function devloopExtension(pi: ExtensionAPI): void {
+    // ── Mutable extension state (per-instance) ──────────────────────────
+    //
+    // These are NOT automatically carried across session replacements.
+    // See the module-level doc "State persistence across sessions" for how
+    // state survives via custom entries + session_start restore.
+    //
     let activeSlug: string | undefined;
     let needsPlanPrefix = false;
     let autoMode = false;
+
+    // cachedCmdCtx: the most recent ExtensionCommandContext from a /devloop
+    // command invocation. This is the ONLY way to get a context that has
+    // newSession() from inside event hooks like agent_end.
+    //
+    // WHY: agent_end gives ExtensionContext (no newSession). Command handlers
+    // give ExtensionCommandContext (has newSession). We cache the command
+    // context so event handlers can use it later.
+    //
+    // CAVEAT: This context becomes stale after session replacement.
+    // It must only be used BEFORE ctx.newSession() is called, or inside
+    // the withSession callback via the newCtx parameter (not this cache).
+    //
     let cachedCmdCtx: ExtensionCommandContext | undefined;
 
     // ─── Widget management ──────────────────────────────────────────────
@@ -252,6 +377,23 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     }
 
     // ─── Auto-loop drive logic ─────────────────────────────────────────────
+    //
+    // driveAutoLoop is called from agent_end when autoMode is true.
+    // It determines the next step (plan / implement / complete) and dispatches.
+    //
+    // For "plan" and "complete", it can act directly (sendUserMessage or clearState).
+    //
+    // For "implement", it CANNOT call ctx.newSession() directly because:
+    //   - The ctx passed to agent_end is ExtensionContext, not ExtensionCommandContext
+    //   - newSession() only exists on ExtensionCommandContext
+    //
+    // Instead, it emits an event via pi.events.emit("devloop:implement").
+    // The event handler (registered above) picks it up and calls
+    // handleDoImplement(cachedCmdCtx) which HAS the right context type.
+    //
+    // This indirection is the entire reason the event bus pattern exists.
+    // See module-level doc for the full explanation.
+    //
 
     /** Drive the auto-loop: determine next step and dispatch action */
     function driveAutoLoop(ctx: { cwd: string; hasUI: boolean; ui: any; getContextUsage(): { tokens: number; contextWindow: number } | null }): void {
@@ -299,6 +441,19 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     }
 
     // ─── Event bus handlers ─────────────────────────────────────────────────
+    //
+    // These handlers are the bridge between the UI (popup actions, agent_end)
+    // and the command handlers that have the right context types.
+    //
+    // Popup actions → emit event → event handler uses cachedCmdCtx → calls
+    //   the actual handler function.
+    //
+    // WHY NOT just call the handler directly from the popup?
+    //   The popup runs inside agent_end's ctx (ExtensionContext).
+    //   Most popup actions only need pi.sendUserMessage() which works from
+    //   anywhere. But "implement" needs cachedCmdCtx.newSession().
+    //   Using events for ALL popup actions keeps the pattern consistent.
+    //
 
     pi.events.on("devloop:accept-plan", () => {
         if (!activeSlug) return;
@@ -380,6 +535,29 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     }
 
     // ─── Session restore ──────────────────────────────────────────────────
+    //
+    // session_start fires for EVERY new session — including the replacement
+    // session created by ctx.newSession(). When a new session is created,
+    // Pi instantiates a NEW extension instance, so all closure state is gone.
+    //
+    // This handler restores state by reading the custom entry that was written
+    // in the setup callback of ctx.newSession(). It scans entries in reverse
+    // to find the most recent devloop-state entry.
+    //
+    // LIFECYCLE during session replacement:
+    //   1. ctx.newSession() is called (in handleDoImplement)
+    //   2. setup(sm) runs — sm.appendCustomEntry writes { slug, active: true, autoMode: true }
+    //   3. Old session emits session_shutdown, is torn down
+    //   4. New session is created, rebound
+    //   5. NEW extension instance created → session_start fires → THIS HANDLER
+    //   6. We read back the custom entry → restore activeSlug, autoMode
+    //   7. withSession callback runs (in the ORIGINAL closure, with shouldAutoSubmit)
+    //
+    // Step 7 is why shouldAutoSubmit is captured BEFORE ctx.newSession() —
+    // by the time withSession runs, this handler has already reset and
+    // restored autoMode in the NEW instance, but withSession runs in the
+    // OLD instance's closure where shouldAutoSubmit was captured.
+    //
 
     pi.on("session_start", async (_event, ctx) => {
         activeSlug = undefined;
@@ -407,6 +585,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     });
 
     // ─── Commands ────────────────────────────────────────────────────────
+    //
+    // The /devloop command handler is the entry point for all user-triggered
+    // actions AND the place where we cache the ExtensionCommandContext.
+    //
 
     pi.registerCommand("devloop", {
         description: "DevLoop workflow commands",
@@ -420,7 +602,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return subcommands.filter((s) => s.value.startsWith(prefix));
         },
         handler: async (args, ctx) => {
-            cachedCmdCtx = ctx;  // Cache for event handlers
+            // CRITICAL: Cache the command context on every invocation.
+            // This is the only reliable source of ExtensionCommandContext
+            // (which has newSession) for use in event handlers later.
+            cachedCmdCtx = ctx;
             const parts = args.trim().split(/\s+/);
             const sub = parts[0];
             const rest = parts.slice(1).join(" ");
@@ -520,7 +705,52 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         ctx.ui.notify(`DevLoop "${slug}" exited.`, "info");
     }
 
-    async function handleDoImplement(
+    // ─── handleDoImplement: Session handoff ────────────────────────────
+    //
+    // This is the most dangerous function in the extension. It calls
+    // ctx.newSession() which replaces the current session. After that
+    // point, the old `pi` and old `ctx` are STALE and will THROW if used
+    // for any session-bound operation.
+    //
+    // THINGS THAT HAVE BEEN TRIED AND FAILED:
+    //
+    //   ❌ pi.sendUserMessage(fullPrompt) after ctx.newSession()
+    //      → stale pi, throws. Message never appears in new session.
+    //      The process may crash or silently fail depending on the error.
+    //
+    //   ❌ pi.setSessionName(slug) inside withSession callback
+    //      → stale pi, throws. This was the bug that caused pi to exit
+    //      completely during auto-implement. The exception was unhandled
+    //      inside the withSession async callback and killed the process.
+    //
+    //   ❌ ctx.ui.setEditorText(fullPrompt) after ctx.newSession()
+    //      → stale ctx, throws. Same category as stale pi.
+    //
+    //   ❌ pi.sendMessage({ ... }, { triggerTurn: true }) after newSession
+    //      → stale pi, throws.
+    //
+    //   ❌ Not using withSession at all, just hoping newSession works
+    //      → new session is created but empty. No prompt delivered.
+    //      sendUserMessage on stale objects silently fails or crashes.
+    //
+    // WHAT WORKS: The withSession pattern (see handoff.ts example in Pi).
+    //
+    //   await ctx.newSession({
+    //       setup: async (sm) => { sm.appendCustomEntry(...) },
+    //       withSession: async (newCtx) => {
+    //           await newCtx.sendUserMessage(fullPrompt);  // ✅
+    //           newCtx.ui.setEditorText(fullPrompt);        // ✅
+    //           // pi.setSessionName(slug);                  // ❌ STILL STALE
+    //       },
+    //   });
+    //
+    // The withSession callback receives a fresh ReplacedSessionContext
+    // (newCtx) that is bound to the new session. Only use newCtx.
+    //
+    // Trade-off: We can't set the session name because pi.setSessionName
+    // is on the stale pi object and ReplacedSessionContext doesn't have it.
+    // Prompt delivery > cosmetic session name.
+    //
         ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
     ): Promise<void> {
         if (!activeSlug) {
@@ -584,8 +814,18 @@ ${implementPrompt}
 Parent session: ${currentSessionFile}
 You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
 
-        // Capture autoMode before session switch — withSession runs after
-        // session_start, which resets and restores closure state.
+        // Capture autoMode BEFORE session switch.
+        //
+        // withSession runs AFTER session_start, which means:
+        //   1. New extension instance created
+        //   2. session_start handler fires → resets activeSlug/autoMode → reads
+        //      custom entry back → restores autoMode = true in NEW instance
+        //   3. withSession fires in ORIGINAL instance closure
+        //
+        // But closure `autoMode` in the ORIGINAL instance may have been
+        // reset by the old instance's session_start or shutdown. So we
+        // capture it here as a plain boolean (shouldAutoSubmit) which is
+        // just stack data — it survives fine across the closure boundary.
         const shouldAutoSubmit = autoMode;
 
         const result = await ctx.newSession({
