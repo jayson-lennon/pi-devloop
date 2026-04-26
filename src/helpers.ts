@@ -4,7 +4,7 @@
  * File and prompt helpers with zero Pi dependency.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 /** Slugify a string: lowercase, non-alphanumeric → dash, collapse doubles */
@@ -56,4 +56,22 @@ export function readHighLevelPlan(cwd: string, slug: string): string | null {
     } catch {
         return null;
     }
+}
+
+/** Discover all devloop plan slugs on disk, sorted most recent first */
+export function discoverPlanSlugs(cwd: string): { slug: string; mtime: number }[] {
+    const plansDir = resolve(cwd, ".plans");
+    if (!existsSync(plansDir)) return [];
+
+    const results: { slug: string; mtime: number }[] = [];
+    for (const entry of readdirSync(plansDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const planFile = resolve(plansDir, entry.name, "high-level.md");
+        if (!existsSync(planFile)) continue;
+        const stat = statSync(planFile);
+        results.push({ slug: entry.name, mtime: stat.mtimeMs });
+    }
+
+    results.sort((a, b) => b.mtime - a.mtime);
+    return results;
 }

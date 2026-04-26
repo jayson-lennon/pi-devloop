@@ -5,7 +5,8 @@
  * session handoffs for implementation phases.
  *
  * Commands:
- *   /devloop new <task>    — Start a new devloop workflow
+ *   /devloop new <task>        — Start a new devloop workflow
+ *   /devloop resume [task]     — Resume an existing devloop task
  *
  * The extension shows a popup after every agent turn (when active) with
  * context-aware options based on whether the high-level plan exists on disk.
@@ -123,7 +124,9 @@
  *
  * Returning to a devloop session is handled by Pi's built-in /resume — the
  * session_start handler automatically restores the slug and widget from the
- * custom entry. No separate /devloop resume command is needed.
+ * custom entry. However, the auto-loop's implement step requires cachedCmdCtx
+ * which is only available after running a /devloop command. Use
+ * /devloop resume <task> to re-enter the loop and hydrate cachedCmdCtx.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
@@ -132,7 +135,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { ENTRY_TYPE, WIDGET_ID } from "./constants.js";
-import { assemblePlanDetailedPrompt, assemblePlanPrompt, slugify } from "./helpers.js";
+import { assemblePlanDetailedPrompt, assemblePlanPrompt, discoverPlanSlugs, planFileExists, slugify } from "./helpers.js";
 import { deriveNextStep, getWorkflowStatus, isContextOverLimit, renderProgressLines } from "./phases.js";
 import { handleDoImplement } from "./implement.js";
 import { showDevloopPopup } from "./popup.js";
@@ -309,7 +312,15 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
     pi.events.on("devloop:implement", async (data) => {
         const { slug } = data as { slug: string };
-        if (!cachedCmdCtx || !activeSlug || activeSlug !== slug) return;
+        if (!activeSlug || activeSlug !== slug) return;
+        if (!cachedCmdCtx) {
+            pi.sendMessage({
+                customType: "devloop",
+                content: `⚠ Cannot auto-implement — run \`/devloop resume ${slug}\` to re-enter the loop.`,
+                display: true,
+            }, { triggerTurn: false });
+            return;
+        }
         await handleDoImplement(slug, autoMode, cachedCmdCtx);
     });
 
@@ -403,10 +414,16 @@ export default function devloopExtension(pi: ExtensionAPI): void {
     pi.registerCommand("devloop", {
         description: "DevLoop workflow commands",
         getArgumentCompletions: (prefix: string) => {
+            if (!prefix) {
+                return [
+                    { value: "new ", label: "new <task> — Start a new devloop workflow" },
+                    { value: "resume ", label: "resume [task] — Resume an existing devloop" },
+                ];
+            }
             const subcommands = [
                 { value: "new ", label: "new <task> — Start a new devloop workflow" },
+                { value: "resume ", label: "resume [task] — Resume an existing devloop" },
             ];
-            if (!prefix) return subcommands;
             return subcommands.filter((s) => s.value.startsWith(prefix));
         },
         handler: async (args, ctx) => {
@@ -420,8 +437,10 @@ export default function devloopExtension(pi: ExtensionAPI): void {
 
             if (sub === "new") {
                 await handleNew(rest, ctx);
+            } else if (sub === "resume") {
+                await handleResume(rest, ctx);
             } else {
-                ctx.ui.notify("Usage: /devloop new <task description>", "warning");
+                ctx.ui.notify("Usage: /devloop new <task> | /devloop resume [task]", "warning");
             }
         },
     });
@@ -474,6 +493,98 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         }, { triggerTurn: false });
     }
 
+    async function handleResume(
+        args: string,
+        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
+    ): Promise<void> {
+        const task = args.trim();
+        let targetSlug: string | undefined;
+
+        if (task) {
+            // /devloop resume <task>
+            targetSlug = slugify(task);
+            if (!targetSlug) {
+                ctx.ui.notify("Could not generate a slug from the task name.", "error");
+                return;
+            }
+            if (!planFileExists(ctx.cwd, targetSlug)) {
+                ctx.ui.notify(
+                    `No plan found for "${targetSlug}" in .plans/${targetSlug}/. Run /devloop new to create one.`,
+                    "error",
+                );
+                return;
+            }
+        } else {
+            // /devloop resume — show picker
+            const slugs = discoverPlanSlugs(ctx.cwd);
+            if (slugs.length === 0) {
+                ctx.ui.notify("No devloop tasks found in .plans/.", "info");
+                return;
+            }
+            if (slugs.length === 1) {
+                targetSlug = slugs[0]!.slug;
+            } else {
+                const options = slugs.map(s => s.slug);
+                const choice = await ctx.ui.select("Select a devloop task to resume:", options);
+                if (!choice) return;
+                targetSlug = choice;
+            }
+        }
+
+        if (!targetSlug) return; // picker cancelled
+
+        // Reject if this session is already bound to a DIFFERENT devloop.
+        // Allow if bound to the SAME slug (re-hydration of cachedCmdCtx).
+        if (activeSlug && activeSlug !== targetSlug) {
+            ctx.ui.notify(
+                `This session is already bound to devloop "${activeSlug}". Start a new Pi session for a different devloop.`,
+                "warning",
+            );
+            return;
+        }
+
+        await doResume(ctx, targetSlug);
+    }
+
+    async function doResume(
+        ctx: Parameters<Parameters<typeof pi.registerCommand>[1]["handler"]>[1],
+        slug: string,
+    ): Promise<void> {
+        const alreadyBound = activeSlug === slug; // re-hydration vs fresh bind
+
+        // 1. Bind slug
+        activeSlug = slug;
+
+        // 2. THE ENTIRE POINT: hydrate cachedCmdCtx
+        cachedCmdCtx = ctx;
+
+        // 3. Persist state and set session name only for fresh binds
+        if (!alreadyBound) {
+            persistState();
+            pi.setSessionName(slug);
+        }
+
+        // 4. Refresh widget
+        refreshWidget(ctx);
+
+        // 5. Notify and drive loop
+        const { workflowStep } = getWorkflowStatus(ctx.cwd, slug);
+        if (alreadyBound) {
+            ctx.ui.notify(`Re-entered devloop "${slug}".`, "info");
+        } else if (workflowStep === "complete") {
+            ctx.ui.notify(`Resumed devloop "${slug}" — all phases complete.`, "info");
+        } else if (autoMode) {
+            ctx.ui.notify(`Resumed devloop "${slug}" in auto mode.`, "info");
+        } else {
+            ctx.ui.notify(`Resumed devloop "${slug}" in manual mode.`, "info");
+        }
+
+        // 6. If auto mode, drive the loop immediately
+        if (autoMode && workflowStep !== "complete") {
+            driveAutoLoop(ctx);
+        }
+    }
+
     // ─── Hook: input ──────────────────────────────────────────────────────
 
     pi.on("input", async (event, ctx) => {
@@ -504,8 +615,19 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             return;
         }
 
-        // Auto mode: drive the loop (unless turn was aborted)
+        // Auto mode: drive the loop (unless turn was aborted or cachedCmdCtx missing)
         if (autoMode) {
+            if (!cachedCmdCtx) {
+                // Auto-loop stuck — cachedCmdCtx not hydrated.
+                // Notify user and fall through to popup.
+                ctx.ui.notify(
+                    `Auto-loop paused — run \`/devloop resume ${activeSlug}\` to continue.`,
+                    "warning",
+                );
+                showDevloopPopup(pi, ctx, activeSlug, autoMode);
+                return;
+            }
+
             const messages = event.messages ?? [];
             let wasAborted = false;
             for (let i = messages.length - 1; i >= 0; i--) {

@@ -16,25 +16,26 @@ Since we generate the detailed plan at the start of each implementation phase, i
 
 ## Usage
 
-1. `/devloop new "name of this task"`
-2. Describe what to do for the task
-3. Iterate on plan with agent
-4. (Popup) Accept plan
-5. (Popup) Generate detailed plan
-6. (Popup) Implement
-7. You are in the loop. Now it's just 4, 5, 6 until feature is complete.
+1. Run `/devloop new "task name"` — this creates a plan directory under `.plans/` and binds the session to the workflow.
+2. Describe what you want done in the chat — the agent generates a high-level plan.
+3. Press `Ctrl+Q` to open the popup — choose **Accept plan** (or **Accept plan & Auto mode**).
+4. Press `Ctrl+Q` again — choose **Make detailed plan** to flesh out the next phase.
+5. Press `Ctrl+Q` again — choose **Implement (new session)** to spin up an implementation session.
+6. Repeat steps 4–5 until all phases are complete.
 
 ### Resuming
 
-DevLoop uses the `.plans` directory to store plans and calculates the current state from the plans themselves. You can resume any DevLoop session using the standard `/resume` command Pi offers, and then pressing `Ctrl+Q` to activate the popup.
+DevLoop stores all state in the `.plans/` directory and in the session itself. Use Pi's built-in `/resume` to return to a DevLoop session — the slug, phase progress, and mode (auto/manual) are restored automatically. Press `Ctrl+Q` to pick up where you left off.
 
-If `Ctrl+Q` doesn't work for some reason, then type `/devloop resume "name of the plan"`
+### Auto mode
 
-### Full auto?
+**Auto mode** is available from the popup — choose **Accept plan & Auto mode** or **Auto mode** at any point to let DevLoop drive the loop. It will automatically plan detailed phases, implement them, and repeat until all phases are done.
 
-Not yet. Sometimes there is an unforeseen critical issue when generating the detailed plan. LLMs are bad at deciding what "critical" is and what the best course of action is for your project.
+Auto mode stops if the agent turn is aborted (you press Escape) or if context utilization exceeds 70%, at which point you should compact the session or switch to manual mode via the popup.
 
-If you have any ideas on how to reliably get the agent to make decent decisions, feel free to open an issue and discuss.
+Manual mode is the default — you pick each action via the popup after every agent turn.
+
+> **Note:** A session is permanently bound to its DevLoop. There is no "exit" or "pause" — once you start a DevLoop, that session is always a DevLoop session.
 
 ## Installation
 
@@ -52,12 +53,21 @@ pi update https://github.com/jayson-lennon/pi-devloop
 
 ## Commands
 
-| Command                  | Description                                                                                                                                     |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/devloop new <task>`    | Start a new DevLoop workflow. Instructions will be displayed on screen.                                                                         |
-| `/devloop resume <slug>` | Re-attach DevLoop to an existing plan (directory under `.plans/`). Use this if you resume a session and `Ctrl+Q` doesn't work or after exiting. |
-| `/devloop exit`          | Exit the current DevLoop. If you want to stop using DevLoop mid-session, use this command.                                                      |
-| `Ctrl+Q`                 | Show the DevLoop popup (when active).                                                                                                           |
+| Command               | Description                                                      |
+| --------------------- | ---------------------------------------------------------------- |
+| `/devloop new <task>` | Start a new DevLoop workflow. Instructions will be displayed.    |
+| `Ctrl+Q`              | Show the DevLoop popup with context-aware options (when active). |
+
+### Popup actions (via `Ctrl+Q`)
+
+The popup shows different options depending on the current state:
+
+| State        | Available actions                                                       |
+| ------------ | ----------------------------------------------------------------------- |
+| Pre-plan     | Talk to agent, Accept plan, Accept plan & Auto mode                    |
+| Post-plan    | Talk to agent, Make detailed plan, Implement (new session), Auto mode  |
+| Auto mode    | Switch to manual                                                        |
+| Complete     | Talk to agent                                                           |
 
 ## Notes
 
