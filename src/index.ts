@@ -500,7 +500,7 @@ export default function devloopExtension(pi: ExtensionAPI): void {
         // All phases complete — mark done and show completion popup
         if (workflowStep === "complete") {
             markComplete(ctx);
-            await showDevloopPopup(pi, ctx, activeSlug, autoMode);
+            showDevloopPopup(pi, ctx, activeSlug, autoMode);
             return;
         }
 
@@ -521,12 +521,13 @@ export default function devloopExtension(pi: ExtensionAPI): void {
             }
             // Turn was aborted (user hit ESC) — show popup so they can
             // decide whether to keep driving or switch to manual.
-            await showDevloopPopup(pi, ctx, activeSlug, autoMode);
+            showDevloopPopup(pi, ctx, activeSlug, autoMode);
             return;
         }
 
-        // Manual mode: show popup
-        await showDevloopPopup(pi, ctx, activeSlug, autoMode);
+        // Manual mode: show popup (fire-and-forget so agent_end resolves
+        // and Pi stops the spinner)
+        showDevloopPopup(pi, ctx, activeSlug, autoMode);
     });
 
     // ─── Shortcut: Ctrl+Q ────────────────────────────────────────────────────
