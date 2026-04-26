@@ -106,21 +106,12 @@ ${implementPrompt}
 Parent session: ${currentSessionFile}
 You can use the session_query tool with this path to look up decisions, discussions, or context from the planning session.`;
 
-    // Capture autoMode BEFORE session switch.
-    //
-    // withSession runs AFTER session_start, which means:
-    //   1. New extension instance created
-    //   2. session_start handler fires → resets state → reads custom entry back
-    //   3. withSession fires in ORIGINAL instance closure
-    //
-    // autoMode is captured here as a plain boolean (shouldAutoSubmit) which is
-    // just stack data — it survives fine across the closure boundary.
-    const shouldAutoSubmit = autoMode;
-
+    // autoMode is passed through to the custom entry so the replacement session
+    // restores the correct mode.
     const result = await ctx.newSession({
         parentSession: currentSessionFile,
         setup: async (sm: any) => {
-            sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true, autoMode: true });
+            sm.appendCustomEntry(ENTRY_TYPE, { slug, active: true, autoMode });
         },
         withSession: async (newCtx: any) => {
             // withSession runs after session replacement: old pi/ctx are stale.
@@ -129,11 +120,7 @@ You can use the session_query tool with this path to look up decisions, discussi
             // NOTE: pi.setSessionName(slug) would throw here — pi is stale.
             // Session name is less important than getting the prompt delivered.
 
-            if (shouldAutoSubmit) {
-                await newCtx.sendUserMessage(fullPrompt);
-            } else {
-                newCtx.ui.setEditorText(fullPrompt);
-            }
+            await newCtx.sendUserMessage(fullPrompt);
         },
     });
 
